@@ -6,6 +6,8 @@ import os
 import argparse
 from sklearn.cluster import KMeans
 from ultralytics import YOLO
+import matplotlib.pyplot as plt
+from collections import Counter
 
 def get_dominant_color(frame, bbox, top_percent=0.5, middle_x_percent=0.8, n_clusters=3, pixel_threshold=50):
     x1, y1, x2, y2 = bbox
@@ -52,6 +54,191 @@ def get_dominant_color(frame, bbox, top_percent=0.5, middle_x_percent=0.8, n_clu
 
     return dominant_color
 
+def get_bbox_size(bbox):
+    x1, y1, x2, y2 = bbox
+    return (x2 - x1) * (y2 - y1)
+
+def get_overlapping_bboxes(frame):
+    detections = frame['detections']
+    overlapping_pairs = []
+    
+    for i, detection1 in enumerate(detections):
+        bbox1 = detection1['bbox']
+        x1_min, y1_min, x1_max, y1_max = bbox1
+        
+        for j, detection2 in enumerate(detections[i+1:], i+1):
+            bbox2 = detection2['bbox']
+            x2_min, y2_min, x2_max, y2_max = bbox2
+            
+            # Check if bboxes overlap
+            if not (x1_max < x2_min or x2_max < x1_min or 
+                   y1_max < y2_min or y2_max < y1_min):
+                overlapping_pairs.append((detection1['track_id'], detection2['track_id']))
+                
+    return overlapping_pairs
+
+def process_player_detections(data):
+    # Extract all unique track IDs
+    all_track_ids = []
+    for frame in data:
+        for detection in frame['detections']:
+            all_track_ids.append(detection['track_id'])
+    
+    all_unique_track_ids = list(set(all_track_ids))
+    
+    # Collect colors for each track ID
+    track_id_to_colors = {}
+    for track_id in all_unique_track_ids:
+        track_id_to_colors[track_id] = []
+
+        for frame in data:
+            overlapping_pairs = get_overlapping_bboxes(frame)
+            
+            overlapping_track_ids = []
+            for i, j in overlapping_pairs:
+                overlapping_track_ids.append(i)
+                overlapping_track_ids.append(j)
+            overlapping_track_ids = list(set(overlapping_track_ids))
+            
+            for detection in frame['detections']:
+                if detection['track_id'] == track_id:
+                    track_id_to_colors[track_id].append(
+                        {
+                            "frame_id": frame['frame_id'],
+                            "dominant_color_rgb": detection['dominant_color_rgb'], 
+                            "bbox_size": get_bbox_size(detection['bbox']),
+                            "has_overlap": track_id in overlapping_track_ids
+                        }
+                    )
+    
+    # Calculate confidence for each color detection
+    for track_id, colors in track_id_to_colors.items():
+        if len(colors) == 0:
+            continue
+        
+        bbox_sizes = [color['bbox_size'] for color in colors]
+        max_bbox_size = max(bbox_sizes)
+
+        for color in colors:
+            color["confidence"] = 1 - (color["bbox_size"] / max_bbox_size)
+            if color["has_overlap"]:
+                color["confidence"] = 0
+    
+    # Collect all non-overlapping player colors
+    all_player_colors = []
+    for track_id, colors in track_id_to_colors.items():
+        if len(colors) == 0:
+            continue
+            
+        non_overlapping_colors = [color for color in colors if not color['has_overlap']]
+        
+        if len(non_overlapping_colors) == 0:
+            continue
+
+        all_player_colors.extend(non_overlapping_colors)
+    
+    return all_player_colors, track_id_to_colors, all_unique_track_ids
+
+def create_color_clusters(all_player_colors, output_plot_path):
+    # Extract RGB colors and confidences
+    rgb_colors = np.array([color['dominant_color_rgb'] for color in all_player_colors])
+    confidences = np.array([color['confidence'] for color in all_player_colors])
+
+    # Normalize RGB values to 0-1 range if needed
+    rgb_colors = rgb_colors / 255.0 if np.any(rgb_colors > 1.0) else rgb_colors
+
+    # Perform k-means clustering with 3 clusters
+    kmeans = KMeans(n_clusters=3, random_state=42)
+    cluster_labels = kmeans.fit_predict(rgb_colors)
+
+    # Get cluster sizes and sort indices by size (descending)
+    cluster_sizes = np.bincount(cluster_labels)
+    cluster_size_order = np.argsort(-cluster_sizes)
+
+    # Map clusters to teams/referee based on size
+    cluster_mapping = {
+        cluster_size_order[0]: 'Team 1',
+        cluster_size_order[1]: 'Team 2', 
+        cluster_size_order[2]: 'Referee'
+    }
+
+    # Create scatter plot
+    plt.figure(figsize=(10, 8))
+
+    # Plot each cluster with different colors and labels
+    colors = ['blue', 'red', 'yellow']
+    for i, cluster_idx in enumerate(cluster_size_order):
+        mask = cluster_labels == cluster_idx
+        plt.scatter(
+            rgb_colors[mask, 0], 
+            rgb_colors[mask, 1],
+            c=colors[i],
+            marker='o',
+            s=100 * confidences[mask],
+            label=f'{cluster_mapping[cluster_idx]} (n={cluster_sizes[cluster_idx]})'
+        )
+
+    plt.xlabel('Red')
+    plt.ylabel('Green')
+    plt.title('RGB Color Clusters of Players')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(output_plot_path)
+    plt.close()
+
+    # Create a figure to display average colors
+    plt.figure(figsize=(10, 2))
+
+    # Plot each cluster center as a solid color patch
+    for i, cluster_idx in enumerate(cluster_size_order):
+        center = kmeans.cluster_centers_[cluster_idx]
+        plt.subplot(1, 3, i+1)
+        plt.axis('off')
+        plt.title(cluster_mapping[cluster_idx])
+        plt.imshow([[center]])
+
+    plt.tight_layout()
+    plt.savefig(f"{os.path.splitext(output_plot_path)[0]}_centers.png")
+    plt.close()
+
+    return kmeans, cluster_mapping, cluster_size_order
+
+def assign_teams_to_players(track_id_to_colors, kmeans, cluster_mapping, cluster_size_order):
+    track_id_to_team = {}
+    for track_id, colors in track_id_to_colors.items():
+        if len(colors) == 0:
+            continue
+            
+        # Filter out colors with overlap
+        non_overlapping_colors = [color for color in colors if not color['has_overlap']]
+        
+        if len(non_overlapping_colors) == 0:
+            continue
+            
+        # Calculate average RGB color from non-overlapping detections only
+        rgb_values = np.array([color['dominant_color_rgb'] for color in non_overlapping_colors])
+
+        team_assignments = []
+        for rgb_color in rgb_values:
+            # Normalize RGB values to [0,1] range
+            rgb_color = [x/255.0 for x in rgb_color]
+            
+            # Find closest cluster center
+            distances = np.linalg.norm(kmeans.cluster_centers_ - rgb_color, axis=1)
+            closest_cluster_idx = np.argmin(distances)
+            # Map to the team based on the cluster
+            for i, idx in enumerate(cluster_size_order):
+                if idx == closest_cluster_idx:
+                    closest_cluster = cluster_mapping[idx]
+                    break
+            team_assignments.append(closest_cluster)
+
+        # Use majority voting to determine the final team assignment
+        most_common_team = Counter(team_assignments).most_common(1)[0][0]
+        track_id_to_team[track_id] = most_common_team
+    
+    return track_id_to_team
+
 def process_video(input_path):
     os.makedirs('models', exist_ok=True)
 
@@ -78,6 +265,8 @@ def process_video(input_path):
 
     output_video_path = f"{base_dir}/player_detections.mp4"
     output_json_path = f"{base_dir}/player_detections.json"
+    output_team_json_path = f"{base_dir}/player_detections_with_team.json"
+    output_plot_path = f"{base_dir}/player_color_clusters.png"
     frames_dir = os.path.join(base_dir, 'frames_rgb')
     
     original_frames_dir = os.path.join(base_dir, 'frames')
@@ -175,6 +364,30 @@ def process_video(input_path):
     # Save all detections to JSON
     with open(output_json_path, 'w') as f:
         json.dump(all_detections, f, indent=4)
+        
+    # Process player detections to assign teams
+    all_player_colors, track_id_to_colors, all_unique_track_ids = process_player_detections(all_detections)
+    
+    # Create color clusters
+    kmeans, cluster_mapping, cluster_size_order = create_color_clusters(all_player_colors, output_plot_path)
+    
+    # Assign teams to players
+    track_id_to_team = assign_teams_to_players(track_id_to_colors, kmeans, cluster_mapping, cluster_size_order)
+    
+    # Add team information to the original detections
+    for frame in all_detections:
+        for detection in frame['detections']:
+            track_id = detection['track_id']
+            if track_id in track_id_to_team:
+                detection['team'] = track_id_to_team[track_id]
+            else:
+                detection['team'] = 'Unknown'
+    
+    # Save the updated detections to JSON
+    with open(output_team_json_path, 'w') as f:
+        json.dump(all_detections, f, indent=4)
+        
+    print(f"Processed {len(track_id_to_team)} players. Team assignments saved successfully.")
 
     return frame_count
 
