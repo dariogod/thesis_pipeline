@@ -35,3 +35,11 @@ htmlcov/
 
 # Logs
 *.log
+
+# data
+input/
+intermediate_results/
+
+# output
+output/
+
