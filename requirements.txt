@@ -4,3 +4,4 @@ opencv-python==4.11.0.86
 scikit-learn==1.6.1
 pillow==11.2.1
 lap==0.5.12
+scikit-image==0.25.2

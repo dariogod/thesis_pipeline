@@ -8,51 +8,154 @@ from sklearn.cluster import KMeans
 from ultralytics import YOLO
 import matplotlib.pyplot as plt
 from collections import Counter
+from create_color_clusters import create_color_clusters_basic, create_color_clusters_lab
 
-def get_dominant_color(frame, bbox, top_percent=0.5, middle_x_percent=0.8, n_clusters=3, pixel_threshold=50):
+# def get_dominant_color(frame, bbox, top_percent=0.5, middle_x_percent=0.8, n_clusters=3, pixel_threshold=50):
+#     x1, y1, x2, y2 = bbox
+#     h = y2 - y1
+#     w = x2 - x1
+
+#     y_start = y1
+#     y_end = y1 + int(h * top_percent)
+#     x_start = x1 + int(w * (1 - middle_x_percent) / 2)
+#     x_end = x2 - int(w * (1 - middle_x_percent) / 2)
+
+#     cropped = frame[y_start:y_end, x_start:x_end]
+    
+#     # Convert BGR to RGB and then to HSV
+#     rgb_cropped = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+#     hsv = cv2.cvtColor(rgb_cropped, cv2.COLOR_RGB2HSV)
+
+#     # Initial green mask
+#     lower_green = np.array([35, 40, 40])
+#     upper_green = np.array([85, 255, 255])
+#     mask = cv2.inRange(hsv, lower_green, upper_green)
+#     non_green_pixels = rgb_cropped[mask == 0]
+
+#     # If not enough non-green pixels, relax the green mask
+#     if len(non_green_pixels) < pixel_threshold:
+#         lower_green = np.array([40, 50, 50])
+#         upper_green = np.array([80, 255, 255])
+#         mask = cv2.inRange(hsv, lower_green, upper_green)
+#         non_green_pixels = rgb_cropped[mask == 0]
+
+#     # Fallback if still too few
+#     if len(non_green_pixels) < n_clusters:
+#         non_green_pixels = rgb_cropped.reshape(-1, 3)
+
+#     try:
+#         kmeans = KMeans(n_clusters=n_clusters, n_init=10)
+#         kmeans.fit(non_green_pixels)
+#         cluster_centers = kmeans.cluster_centers_.astype(int)
+#         labels, counts = np.unique(kmeans.labels_, return_counts=True)
+#         # Convert numpy int values to Python int in the tuple
+#         dominant_color = tuple(int(v) for v in cluster_centers[np.argmax(counts)])
+#     except Exception:
+#         dominant_color = (0, 0, 0)
+
+#     return dominant_color
+
+def get_dominant_color(frame, bbox, y_range=(0.1, 0.4), x_range=(0.1, 0.9), n_clusters=5, pixel_threshold=10):
     x1, y1, x2, y2 = bbox
     h = y2 - y1
     w = x2 - x1
-
-    y_start = y1
-    y_end = y1 + int(h * top_percent)
-    x_start = x1 + int(w * (1 - middle_x_percent) / 2)
-    x_end = x2 - int(w * (1 - middle_x_percent) / 2)
-
+    
+    # Use specified ranges to crop the player
+    y_start = y1 + int(h * y_range[0])
+    y_end = y1 + int(h * y_range[1])
+    x_start = x1 + int(w * x_range[0])
+    x_end = x1 + int(w * x_range[1])
+    
+    # Make sure we have valid crop dimensions
+    if y_end <= y_start or x_end <= x_start or y_end > frame.shape[0] or x_end > frame.shape[1]:
+        return (0, 0, 0)
+    
     cropped = frame[y_start:y_end, x_start:x_end]
+    
+    # Make sure we have a non-empty crop
+    if cropped.size == 0:
+        return (0, 0, 0)
     
     # Convert BGR to RGB and then to HSV
     rgb_cropped = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
     hsv = cv2.cvtColor(rgb_cropped, cv2.COLOR_RGB2HSV)
-
-    # Initial green mask
-    lower_green = np.array([35, 40, 40])
-    upper_green = np.array([85, 255, 255])
-    mask = cv2.inRange(hsv, lower_green, upper_green)
-    non_green_pixels = rgb_cropped[mask == 0]
-
-    # If not enough non-green pixels, relax the green mask
+    
+    # Create multiple masks to better handle various field colors
+    # Standard green field mask
+    lower_green1 = np.array([35, 40, 40])
+    upper_green1 = np.array([85, 255, 255])
+    mask1 = cv2.inRange(hsv, lower_green1, upper_green1)
+    
+    # Yellowish-green field mask
+    lower_green2 = np.array([25, 40, 40])
+    upper_green2 = np.array([35, 255, 255])
+    mask2 = cv2.inRange(hsv, lower_green2, upper_green2)
+    
+    # Bluish-green field mask (for some artificial turfs)
+    lower_green3 = np.array([85, 40, 40])
+    upper_green3 = np.array([95, 255, 255])
+    mask3 = cv2.inRange(hsv, lower_green3, upper_green3)
+    
+    # Combine all masks
+    combined_mask = mask1 | mask2 | mask3
+    
+    # Get non-green pixels
+    non_green_pixels = rgb_cropped[combined_mask == 0]
+    
+    # If not enough non-green pixels, try a different approach - use brightness to filter
     if len(non_green_pixels) < pixel_threshold:
-        lower_green = np.array([40, 50, 50])
-        upper_green = np.array([80, 255, 255])
-        mask = cv2.inRange(hsv, lower_green, upper_green)
-        non_green_pixels = rgb_cropped[mask == 0]
-
-    # Fallback if still too few
+        # Get brighter pixels (likely to be jersey in well-lit conditions)
+        brightness_mask = hsv[:,:,2] > 80
+        bright_pixels = rgb_cropped[brightness_mask]
+        
+        if len(bright_pixels) >= pixel_threshold:
+            non_green_pixels = bright_pixels
+        else:
+            # Just use all pixels as a fallback
+            non_green_pixels = rgb_cropped.reshape(-1, 3)
+    
+    # Make sure we have enough pixels for clustering
     if len(non_green_pixels) < n_clusters:
-        non_green_pixels = rgb_cropped.reshape(-1, 3)
-
+        return (0, 0, 0)
+    
     try:
-        kmeans = KMeans(n_clusters=n_clusters, n_init=10)
+        # Use more clusters for better color detection
+        kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
         kmeans.fit(non_green_pixels)
         cluster_centers = kmeans.cluster_centers_.astype(int)
-        labels, counts = np.unique(kmeans.labels_, return_counts=True)
+        
+        # Find the most dominant non-background color
+        labels = kmeans.labels_
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        
+        # Sort clusters by count (descending)
+        sorted_indices = np.argsort(-counts)
+        sorted_centers = cluster_centers[sorted_indices]
+        sorted_counts = counts[sorted_indices]
+        
+        # Choose the most saturated color among the top 3 most frequent clusters
+        top_n = min(3, len(sorted_centers))
+        max_saturation = 0
+        dominant_color = sorted_centers[0]  # Default to most frequent
+        
+        for i in range(top_n):
+            # Convert RGB to HSV to check saturation
+            rgb_color = sorted_centers[i]
+            hsv_color = cv2.cvtColor(np.uint8([[rgb_color]]), cv2.COLOR_RGB2HSV)[0][0]
+            
+            # Higher weight for more frequent colors, but also consider saturation
+            weighted_saturation = hsv_color[1] * (sorted_counts[i] / sorted_counts[0]) 
+            
+            if weighted_saturation > max_saturation:
+                max_saturation = weighted_saturation
+                dominant_color = rgb_color
+        
         # Convert numpy int values to Python int in the tuple
-        dominant_color = tuple(int(v) for v in cluster_centers[np.argmax(counts)])
-    except Exception:
-        dominant_color = (0, 0, 0)
-
-    return dominant_color
+        return tuple(int(v) for v in dominant_color)
+    
+    except Exception as e:
+        print(f"Error in color clustering: {e}")
+        return (0, 0, 0)
 
 def get_bbox_size(bbox):
     x1, y1, x2, y2 = bbox
@@ -139,70 +242,6 @@ def process_player_detections(data):
     
     return all_player_colors, track_id_to_colors, all_unique_track_ids
 
-def create_color_clusters(all_player_colors, output_plot_path):
-    # Extract RGB colors and confidences
-    rgb_colors = np.array([color['dominant_color_rgb'] for color in all_player_colors])
-    confidences = np.array([color['confidence'] for color in all_player_colors])
-
-    # Normalize RGB values to 0-1 range if needed
-    rgb_colors = rgb_colors / 255.0 if np.any(rgb_colors > 1.0) else rgb_colors
-
-    # Perform k-means clustering with 3 clusters
-    kmeans = KMeans(n_clusters=3, random_state=42)
-    cluster_labels = kmeans.fit_predict(rgb_colors)
-
-    # Get cluster sizes and sort indices by size (descending)
-    cluster_sizes = np.bincount(cluster_labels)
-    cluster_size_order = np.argsort(-cluster_sizes)
-
-    # Map clusters to teams/referee based on size
-    cluster_mapping = {
-        cluster_size_order[0]: 'Team 1',
-        cluster_size_order[1]: 'Team 2', 
-        cluster_size_order[2]: 'Referee'
-    }
-
-    # Create scatter plot
-    plt.figure(figsize=(10, 8))
-
-    # Plot each cluster with different colors and labels
-    colors = ['blue', 'red', 'yellow']
-    for i, cluster_idx in enumerate(cluster_size_order):
-        mask = cluster_labels == cluster_idx
-        plt.scatter(
-            rgb_colors[mask, 0], 
-            rgb_colors[mask, 1],
-            c=colors[i],
-            marker='o',
-            s=100 * confidences[mask],
-            label=f'{cluster_mapping[cluster_idx]} (n={cluster_sizes[cluster_idx]})'
-        )
-
-    plt.xlabel('Red')
-    plt.ylabel('Green')
-    plt.title('RGB Color Clusters of Players')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(output_plot_path)
-    plt.close()
-
-    # Create a figure to display average colors
-    plt.figure(figsize=(10, 2))
-
-    # Plot each cluster center as a solid color patch
-    for i, cluster_idx in enumerate(cluster_size_order):
-        center = kmeans.cluster_centers_[cluster_idx]
-        plt.subplot(1, 3, i+1)
-        plt.axis('off')
-        plt.title(cluster_mapping[cluster_idx])
-        plt.imshow([[center]])
-
-    plt.tight_layout()
-    plt.savefig(f"{os.path.splitext(output_plot_path)[0]}_centers.png")
-    plt.close()
-
-    return kmeans, cluster_mapping, cluster_size_order
-
 def assign_teams_to_players(track_id_to_colors, kmeans, cluster_mapping, cluster_size_order):
     track_id_to_team = {}
     for track_id, colors in track_id_to_colors.items():
@@ -239,6 +278,65 @@ def assign_teams_to_players(track_id_to_colors, kmeans, cluster_mapping, cluster
     
     return track_id_to_team
 
+def draw_color_legend(frame, track_id_colors, original_width, legend_width):
+    # Define legend parameters
+    square_size = 20
+    padding = 10
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.6
+    font_thickness = 1
+    items_per_column = 7
+    column_width = 60
+    
+    # Calculate how many rows we need for all track IDs
+    track_ids = sorted(track_id_colors.keys())
+    num_tracks = len(track_ids)
+    num_rows = min(items_per_column, num_tracks)
+    
+    # Create a blank legend area on the right
+    legend_height = min(num_rows * (square_size + 10) + 2 * padding, frame.shape[0])
+    legend_y_start = (frame.shape[0] - legend_height) // 2
+    
+    # Draw legend background
+    cv2.rectangle(frame, 
+                 (original_width, legend_y_start), 
+                 (original_width + legend_width, legend_y_start + legend_height), 
+                 (240, 240, 240), -1)
+    
+    # Draw entries for each track ID in three columns
+    for i, track_id in enumerate(track_ids):
+        color = track_id_colors[track_id]
+        
+        # Calculate position based on which column and row
+        column = i // num_rows
+        row = i % num_rows
+        
+        if column >= 3:  # Only display up to 3 columns
+            break
+            
+        # Column starting position
+        col_x = original_width + padding + (column * column_width)
+        
+        # Row position
+        y_pos = legend_y_start + padding + row * (square_size + 10)
+        
+        # Convert RGB to BGR for OpenCV
+        bgr_color = (color[2], color[1], color[0])
+        
+        # Draw color square
+        cv2.rectangle(frame, 
+                     (col_x, y_pos), 
+                     (col_x + square_size, y_pos + square_size), 
+                     bgr_color, -1)
+        
+        # Draw ID text next to the square
+        id_text = f"{track_id}"
+        cv2.putText(frame, id_text, 
+                   (col_x + square_size + 5, y_pos + square_size - 5), 
+                   font, font_scale, (0, 0, 0), font_thickness, cv2.LINE_AA)
+    
+    return frame
+
 def process_video(input_path):
     os.makedirs('models', exist_ok=True)
 
@@ -259,6 +357,10 @@ def process_video(input_path):
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    
+    # Define new width to include the legend
+    legend_width = 250
+    new_width = width + legend_width
 
     base_dir = 'intermediate_results/' + os.path.basename(input_path).split('.')[0]
     os.makedirs(base_dir, exist_ok=True)
@@ -271,8 +373,8 @@ def process_video(input_path):
     
     original_frames_dir = os.path.join(base_dir, 'frames')
     
-    # Define video writer to save output with bounding boxes
-    out = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*'avc1'), fps, (width, height))
+    # Define video writer with the new width to accommodate the legend
+    out = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*'avc1'), fps, (new_width, height))
 
     # Create directories if they don't exist
     os.makedirs(frames_dir, exist_ok=True)
@@ -299,6 +401,9 @@ def process_video(input_path):
 
         frame_detections = []
         
+        # For the color legend
+        frame_track_id_colors = {}
+        
         for r in results:
             boxes = r.boxes
             for box in boxes:
@@ -311,14 +416,15 @@ def process_video(input_path):
                     # Get dominant RGB color from the original unmodified frame
                     dominant_color = get_dominant_color(original_frame, (x1, y1, x2, y2))
                     
+                    # Store color for legend
+                    if track_id is not None:
+                        frame_track_id_colors[track_id] = dominant_color
+                    
                     # Draw bounding box
                     color = (0, 255, 0)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-                    # Draw a colored rectangle at the top of the bounding box to show the dominant color
-                    dc_bgr = (int(dominant_color[2]), int(dominant_color[1]), int(dominant_color[0]))  # Convert RGB to BGR
-                    cv2.rectangle(frame, (x1, y1-20), (x1+20, y1), dc_bgr, -1)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1, lineType=cv2.LINE_8)
                     
+                    # Draw only track ID text
                     label = f"{track_id}"
                     font_scale = 0.9
                     font_thickness = 1
@@ -326,12 +432,12 @@ def process_video(input_path):
 
                     (text_width, text_height), _ = cv2.getTextSize(label, font, font_scale, font_thickness)
                     cv2.rectangle(frame, 
-                                (x1+25, y1 - text_height - 10), 
-                                (x1+25 + text_width + 10, y1), 
+                                (x1, y1 - text_height - 10), 
+                                (x1 + text_width + 10, y1), 
                                 (0, 0, 0), -1)
                     cv2.putText(frame, 
                                 label, 
-                                (x1+30, y1 - 5), 
+                                (x1+5, y1 - 5), 
                                 font, font_scale, 
                                 (255, 255, 255), font_thickness, cv2.LINE_AA)
                     
@@ -343,6 +449,14 @@ def process_video(input_path):
                         'dominant_color_rgb': [int(c) for c in dominant_color]
                     }
                     frame_detections.append(detection)
+        
+        # Create a wider frame to include the legend
+        wide_frame = np.zeros((height, new_width, 3), dtype=np.uint8)
+        wide_frame[:, :width] = frame
+        
+        # Draw the color legend on the wider frame
+        if frame_track_id_colors:
+            wide_frame = draw_color_legend(wide_frame, frame_track_id_colors, width, legend_width)
 
         all_detections.append({
             'frame_id': int(frame_count),
@@ -350,11 +464,11 @@ def process_video(input_path):
         })
         frame_count += 1
         
-        out.write(frame)
+        out.write(wide_frame)
         
         # Save processed frame with bounding boxes
         processed_frame_filename = os.path.join(frames_dir, f"frame_{frame_count:04d}.jpg")
-        cv2.imwrite(processed_frame_filename, frame)
+        cv2.imwrite(processed_frame_filename, wide_frame)
 
     # Release resources
     cap.release()
@@ -369,7 +483,7 @@ def process_video(input_path):
     all_player_colors, track_id_to_colors, all_unique_track_ids = process_player_detections(all_detections)
     
     # Create color clusters
-    kmeans, cluster_mapping, cluster_size_order = create_color_clusters(all_player_colors, output_plot_path)
+    kmeans, cluster_mapping, cluster_size_order = create_color_clusters_lab(all_player_colors, output_plot_path)
     
     # Assign teams to players
     track_id_to_team = assign_teams_to_players(track_id_to_colors, kmeans, cluster_mapping, cluster_size_order)
