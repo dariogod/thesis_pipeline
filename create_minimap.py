@@ -27,11 +27,10 @@ def transform_matrix(M, point, src_size, dst_size):
     return (x_scaled, y_scaled)
 
 
-def transform_image(M, image, src_size, dst_size):
+def transform_image(M, image, dst_size):
     """
     Transform an image using homography matrix and scale to target size
     """
-    h, w = src_size
     dst_h, dst_w = dst_size
 
     # Resize input image to match the dimensions used in homography calculation
@@ -114,17 +113,16 @@ def main(input_path, player_detections_path):
             main_frame = frame.copy()
             # Calculate homography matrix every 2 frames
             if frame_num % 2 == 0:
-                M, warped_image = perspective_transform.homography_matrix(main_frame)
+                M, _ = perspective_transform.homography_matrix(main_frame)
                 last_M = M
                 # Store the homography matrix for this frame
                 homography_data[str(frame_num)] = M.tolist()
-                # Save warped image
-                image_filename = f"frame_{frame_num:06d}.jpg"
-                warped_image_path = os.path.join(warped_images_path, image_filename)
-                cv2.imwrite(warped_image_path, warped_image)
 
-                # transformed_image = transform_image(M, main_frame, (h, w), (gt_h, gt_w))
-                # cv2.imwrite(os.path.join(warped_images_path, f"frame_{frame_num:06d}_transformed.jpg"), transformed_image)
+                # Save warped image
+                # image_filename = f"frame_{frame_num:06d}.jpg"
+                # warped_image_path = os.path.join(warped_images_path, image_filename)
+                # warped_image = transform_image(M, main_frame, (540, 960))
+                # cv2.imwrite(warped_image_path, warped_image)
             else:
                 # Use the last calculated homography matrix
                 M = last_M if last_M is not None else perspective_transform.homography_matrix(main_frame)[0]
