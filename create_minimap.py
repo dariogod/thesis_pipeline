@@ -8,7 +8,26 @@ import json
 import argparse
 
 
-def main(input_path):
+def transform_matrix(M, point, src_size, dst_size):
+    """
+    Transform a point using homography matrix and scale to target size
+    """
+    h, w = src_size
+    dst_h, dst_w = dst_size
+    
+    # Apply homography to the point
+    point_array = np.array([point[0], point[1], 1])
+    warped_point = np.dot(M, point_array)
+    warped_point = warped_point[:2] / warped_point[2]
+    
+    # Scale to target size (115x74 is the standard pitch dimensions)
+    x_scaled = int(warped_point[0] * dst_w / 115)
+    y_scaled = int(warped_point[1] * dst_h / 74)
+    
+    return (x_scaled, y_scaled)
+
+
+def main(input_path, player_detections_path):
     # Load models
     perspective_transform = Perspective_Transform()
 
@@ -30,18 +49,34 @@ def main(input_path):
     
     output_path = os.path.join(base_dir, 'homography')
     warped_images_path = os.path.join(base_dir, 'warped_images')
+    minimap_dir = os.path.join(base_dir, 'minimap')
+    
     os.makedirs(output_path, exist_ok=True)
     os.makedirs(warped_images_path, exist_ok=True)
+    os.makedirs(minimap_dir, exist_ok=True)
+
+    with open(player_detections_path, 'r') as f:
+        player_detections = json.load(f)
+    
+    # Load pitch.jpg as background without resizing
+    gt_img = cv2.imread('pitch.jpg')
+    gt_h, gt_w, _ = gt_img.shape
+    
+    # Calculate circle size based on image dimensions
+    circle_radius = max(2, int(gt_w / 115))
+    
+    # Store the last calculated homography matrix
+    last_M = None
 
     while(cap.isOpened()):
         ret, frame = cap.read()
 
         if ret:
             main_frame = frame.copy()
-            
-            # Calculate the homography matrix every 5 frames
-            if frame_num % 5 == 0:
+            # Calculate homography matrix every 2 frames
+            if frame_num % 2 == 0:
                 M, warped_image = perspective_transform.homography_matrix(main_frame)
+                last_M = M
                 # Store the homography matrix for this frame
                 homography_data[str(frame_num)] = M.tolist()
                 
@@ -49,9 +84,38 @@ def main(input_path):
                 image_filename = f"frame_{frame_num:06d}.jpg"
                 warped_image_path = os.path.join(warped_images_path, image_filename)
                 cv2.imwrite(warped_image_path, warped_image)
+            else:
+                # Use the last calculated homography matrix
+                M = last_M if last_M is not None else perspective_transform.homography_matrix(main_frame)[0]
+            
+            # Get player detections for this frame
+            player_detections_frame = next((det for det in player_detections if det['frame_id'] == frame_num), None)
+            
+            if player_detections_frame:
+                # Create minimap with pitch.jpg as background
+                bg_img = gt_img.copy()
+                
+                for detection in player_detections_frame['detections']:
+                    x, y, w_box, h_box = detection['bbox']
+                    # Use bottom center of bounding box for better positioning
+                    center_x = x + w_box/2
+                    center_y = y + h_box
+                    
+                    # Transform coordinates to minimap
+                    coords = transform_matrix(M, (center_x, center_y), (h, w), (gt_h, gt_w))
+                    
+                    # Only draw if coordinates are within bounds
+                    if 0 <= coords[0] < gt_w and 0 <= coords[1] < gt_h:
+                        # Draw player as circle, color based on team
+                        color = (0, 255, 255) if detection.get('team') == 'Referee' else (0, 0, 0)
+                        # Use calculated circle radius
+                        cv2.circle(bg_img, coords, circle_radius, color, -1)
+                
+                # Save minimap
+                cv2.imwrite(os.path.join(minimap_dir, f'frame_{frame_num:06d}.jpg'), bg_img)
                 
                 sys.stdout.write(
-                    "\r[Input Video : %s] [%d/%d Frames Processed] [Homography calculated] [Warped image saved]"
+                    "\r[Input Video : %s] [%d/%d Frames Processed] [Homography calculated] [Minimap saved]"
                     % (
                         input_path,
                         frame_num,
@@ -67,7 +131,6 @@ def main(input_path):
                         frame_count,
                     )
                 )
-                
             frame_num += 1
         else:
             break
@@ -82,6 +145,7 @@ def main(input_path):
     
     print(f'\n\nHomography matrices have been saved to {output_file}!')
     print(f'Warped images have been saved to {warped_images_path}/')
+    print(f'Minimap images have been saved to {minimap_dir}/')
     
     cap.release()
     cv2.destroyAllWindows()
@@ -91,12 +155,12 @@ def main(input_path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Create minimap from video file')
     parser.add_argument('input', help='Path to input video file')
-    
+    parser.add_argument('--player_detections', help='Path to player detections file', required=True)
     args = parser.parse_args()
     
     try:
         with torch.no_grad():
-            frame_count = main(args.input)
+            frame_count = main(args.input, args.player_detections)
         print(f"Processed {frame_count} frames successfully.")
     except Exception as e:
         print(f"Error processing video: {e}")
