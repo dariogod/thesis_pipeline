@@ -39,6 +39,7 @@ htmlcov/
 # data
 input/
 intermediate_results/
+intermediate_results2/
 weights/
 
 # output
