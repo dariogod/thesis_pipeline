@@ -27,6 +27,45 @@ def transform_matrix(M, point, src_size, dst_size):
     return (x_scaled, y_scaled)
 
 
+def transform_image(M, image, src_size, dst_size):
+    """
+    Transform an image using homography matrix and scale to target size
+    """
+    h, w = src_size
+    dst_h, dst_w = dst_size
+
+    # Resize input image to match the dimensions used in homography calculation
+    resized_image = cv2.resize(image, (1280, 720))
+    
+    # Create output image of desired size
+    warped = np.zeros((dst_h, dst_w, 3), dtype=np.uint8)
+    
+    # For each pixel in the output image
+    for y_out in range(dst_h):
+        for x_out in range(dst_w):
+            # Convert output coordinates to pitch coordinates (115x74)
+            x_pitch = x_out * 115 / dst_w
+            y_pitch = y_out * 74 / dst_h
+            
+            # Apply inverse homography to get input image coordinates
+            point = np.array([x_pitch, y_pitch, 1])
+            inv_warped = np.dot(np.linalg.inv(M), point)
+            inv_warped = inv_warped[:2] / inv_warped[2]
+            
+            # Scale back to input image coordinates
+            x_in = int(inv_warped[0])
+            y_in = int(inv_warped[1])
+            
+            # Copy pixel if within bounds
+            if 0 <= x_in < 1280 and 0 <= y_in < 720:
+                warped[y_out, x_out] = resized_image[y_in, x_in]
+                
+    return warped
+
+def add_detections_to_frame(frame, center_x, center_y):
+    cv2.circle(frame, (int(center_x), int(center_y)), 2, (0, 0, 255), -1)
+
+
 def main(input_path, player_detections_path):
     # Load models
     perspective_transform = Perspective_Transform()
@@ -79,11 +118,13 @@ def main(input_path, player_detections_path):
                 last_M = M
                 # Store the homography matrix for this frame
                 homography_data[str(frame_num)] = M.tolist()
-                
                 # Save warped image
                 image_filename = f"frame_{frame_num:06d}.jpg"
                 warped_image_path = os.path.join(warped_images_path, image_filename)
                 cv2.imwrite(warped_image_path, warped_image)
+
+                # transformed_image = transform_image(M, main_frame, (h, w), (gt_h, gt_w))
+                # cv2.imwrite(os.path.join(warped_images_path, f"frame_{frame_num:06d}_transformed.jpg"), transformed_image)
             else:
                 # Use the last calculated homography matrix
                 M = last_M if last_M is not None else perspective_transform.homography_matrix(main_frame)[0]
@@ -96,10 +137,10 @@ def main(input_path, player_detections_path):
                 bg_img = gt_img.copy()
                 
                 for detection in player_detections_frame['detections']:
-                    x, y, w_box, h_box = detection['bbox']
+                    x1, y1, x2, y2 = detection['bbox']
                     # Use bottom center of bounding box for better positioning
-                    center_x = x + w_box/2
-                    center_y = y + h_box
+                    center_x = x1 + (x2 - x1)/2
+                    center_y = y1 + (y2 - y1)
                     
                     # Transform coordinates to minimap
                     coords = transform_matrix(M, (center_x, center_y), (h, w), (gt_h, gt_w))
