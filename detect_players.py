@@ -483,7 +483,17 @@ def process_video(input_path):
     all_player_colors, track_id_to_colors, all_unique_track_ids = process_player_detections(all_detections)
     
     # Create color clusters
-    kmeans, cluster_mapping, cluster_size_order = create_color_clusters_lab(all_player_colors, output_plot_path)
+    kmeans, cluster_mapping, color_info = create_color_clusters_lab(all_player_colors, output_plot_path)
+    
+    # Calculate cluster sizes and order them
+    if hasattr(kmeans, 'labels_'):
+        # Count elements in each cluster
+        cluster_counts = np.bincount(kmeans.labels_)
+        # Get indices sorted by cluster size (descending)
+        cluster_size_order = np.argsort(-cluster_counts)
+    else:
+        # Fallback if labels_ not available
+        cluster_size_order = list(range(len(cluster_mapping)))
     
     # Assign teams to players
     track_id_to_team = assign_teams_to_players(track_id_to_colors, kmeans, cluster_mapping, cluster_size_order)
