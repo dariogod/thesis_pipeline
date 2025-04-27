@@ -16,7 +16,7 @@ def transform_matrix(M, point, src_size, dst_size):
     dst_h, dst_w = dst_size
     
     # Apply homography to the point
-    point_array = np.array([point[0], point[1], 1])
+    point_array = np.array([point[0] * 1280 / w, point[1] * 720 / h, 1])
     warped_point = np.dot(M, point_array)
     warped_point = warped_point[:2] / warped_point[2]
     
