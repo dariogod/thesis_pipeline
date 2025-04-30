@@ -45,6 +45,9 @@ intermediate_results2/
 intermediate_results3/
 weights/
 
+spike_role_assignment/player_tracker_results/
+spike_role_assignment/role_assignment_results/
+
 # output
 output/
 
