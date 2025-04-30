@@ -1,3 +1,5 @@
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -40,6 +42,7 @@ htmlcov/
 input/
 intermediate_results/
 intermediate_results2/
+intermediate_results3/
 weights/
 
 # output

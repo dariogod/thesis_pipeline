@@ -78,7 +78,7 @@ def main(input_path, player_detections_path):
     homography_data = {}
     
     # Create output directories in intermediate_results folder
-    base_dir = 'intermediate_results2/' + os.path.basename(input_path).split('.')[0]
+    base_dir = 'intermediate_results3/' + os.path.basename(input_path).split('.')[0]
     os.makedirs(base_dir, exist_ok=True)
     
     output_path = os.path.join(base_dir, 'homography')
