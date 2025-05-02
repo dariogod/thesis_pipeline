@@ -23,13 +23,14 @@ else:
 
 
 # Role Assignment
-role_assignment_path = f"role_assignment_results/{action_name}/role_assignment.json"
+# role_assignment_path = f"role_assignment_results/{action_name}/role_assignments.json"
+role_assignment_path = "qsdf"
 if os.path.exists(role_assignment_path):
     print(f"Role assignment already exists for {action_name}, using cached results")
     with open(role_assignment_path, "r") as f:
         role_assignment = json.load(f)
 else:
-    role_assignment = role_assigner.process_detections(input_path, player_detections)
+    role_assignment = role_assigner.process_detections(input_path, player_detections, store_results=True)
 
 
 

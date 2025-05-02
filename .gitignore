@@ -47,6 +47,7 @@ weights/
 
 spike_role_assignment/player_tracker_results/
 spike_role_assignment/role_assignment_results/
+spike_role_assignment/models/
 
 # output
 output/

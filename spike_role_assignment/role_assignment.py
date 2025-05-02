@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from skimage import color
 import matplotlib.gridspec as gridspec
 from mpl_toolkits.mplot3d import Axes3D
+from sklearn.cluster import DBSCAN
 
 class RoleAssigner:
     def __init__(self):
@@ -22,7 +23,9 @@ class RoleAssigner:
             "orange": (255, 165, 0),
             "purple": (128, 0, 128),
             "sky_blue": (135, 206, 235),
+            "grey_blue": [78, 94, 128],
             "navy_blue": (0, 0, 128),
+            "brown": (160, 100, 80),
             "maroon": (128, 0, 0),
             "pink": (255, 192, 203),
             "cyan_blue": (0, 154, 255)
@@ -51,7 +54,7 @@ class RoleAssigner:
             y_range: Tuple[float, float] = (0.0, 0.5), 
             x_range: Tuple[float, float] = (0.0, 1.0),
             visualize: bool = False
-        ) -> Tuple[int, int, int]:
+        ) -> List[Tuple[int, int, int]]:
         x1, y1, x2, y2 = bbox
         roi = frame[int(y1):int(y2), int(x1):int(x2)]
         
@@ -90,19 +93,32 @@ class RoleAssigner:
             labels = kmeans.labels_
             unique_labels, counts = np.unique(labels, return_counts=True)
             
-            sorted_indices = np.argsort(-counts)
-            sorted_counts = counts[sorted_indices]
-            
-            total_pixels = np.sum(counts)
-            percentages = counts / total_pixels
-            
+            # Convert centers to RGB for green comparison
             centers_lab_reshaped = centers_lab.reshape(1, -1, 3)
             centers_rgb = color.lab2rgb(centers_lab_reshaped).reshape(-1, 3)
             centers_rgb_255 = (centers_rgb * 255).astype(int)
             
-            sorted_centers_rgb = centers_rgb[sorted_indices]
-            sorted_centers_rgb_255 = centers_rgb_255[sorted_indices]
-            sorted_centers_lab = centers_lab[sorted_indices]
+            # Determine which cluster is more green (higher G value relative to R and B)
+            green_scores = []
+            for rgb in centers_rgb:
+                # Calculate how "green" the color is (G value relative to R and B)
+                green_score = rgb[1] - (rgb[0] + rgb[2]) / 2
+                green_scores.append(green_score)
+            
+            # Get index of the greenest cluster (background)
+            background_idx = np.argmax(green_scores)
+            jersey_idx = 1 - background_idx  # The other cluster is the jersey
+            
+            # Reorder clusters so background is first, jersey is second
+            cluster_order = [background_idx, jersey_idx]
+            sorted_centers_rgb = centers_rgb[cluster_order]
+            sorted_centers_rgb_255 = centers_rgb_255[cluster_order]
+            sorted_centers_lab = centers_lab[cluster_order]
+            sorted_counts = counts[cluster_order]
+            
+            total_pixels = np.sum(counts)
+            percentages = counts / total_pixels
+            sorted_percentages = percentages[cluster_order]
             
             if visualize:
                 vis_dir = os.path.join(output_dir, 'player_visualizations')
@@ -141,7 +157,7 @@ class RoleAssigner:
                 max_points = 1000
                 sample_indices = np.random.choice(len(lab_pixels), min(max_points, len(lab_pixels)), replace=False)
                 
-                for i, cluster_idx in enumerate(sorted_indices):
+                for i, cluster_idx in enumerate(cluster_order):
                     mask = labels == cluster_idx
                     mask_sampled = np.zeros_like(mask)
                     mask_sampled[sample_indices] = mask[sample_indices]
@@ -164,7 +180,7 @@ class RoleAssigner:
                 ax1.set_title('LAB Color Space Clusters')
                 ax1.legend()
                 
-                for i, cluster_idx in enumerate(sorted_indices):
+                for i, cluster_idx in enumerate(cluster_order):
                     ax = fig.add_subplot(gs[2, i])
                     rgb_color = sorted_centers_rgb[i]
                     rgb_color_255 = sorted_centers_rgb_255[i]
@@ -178,8 +194,10 @@ class RoleAssigner:
                 plt.savefig(os.path.join(vis_dir, filename), dpi=150)
                 plt.close(fig)
             
-            jersey_color = sorted_centers_rgb_255[1] if len(sorted_centers_rgb_255) > 1 else sorted_centers_rgb_255[0]
-            return tuple(int(v) for v in jersey_color)
+            # Return the jersey color (second cluster after reordering)
+            background_color = sorted_centers_rgb_255[0]
+            jersey_color = sorted_centers_rgb_255[1]
+            return tuple(int(v) for v in background_color), tuple(int(v) for v in jersey_color)
         
         except Exception as e:
             print(f"Error in color clustering: {e}")
@@ -229,18 +247,15 @@ class RoleAssigner:
         
         return closest_color_name
     
-    def _calculate_jersey_attributes(self, frame: np.ndarray, bbox: List[int], jersey_color_rgb: Tuple[int, int, int], detections: List[Dict]) -> Dict:
-        """Calculate attributes that help determine confidence in jersey color assignment.
-        
-        Args:
-            frame: The video frame as numpy array
-            bbox: Bounding box coordinates [x1, y1, x2, y2]
-            jersey_color_rgb: The detected jersey RGB color
-            detections: All detections in the current frame
-            
-        Returns:
-            Dictionary containing jersey attribute values
-        """
+    def _calculate_detections_metadata(
+            self, 
+            frame: np.ndarray, 
+            bbox: List[int], 
+            all_background_colors_rgb: List[Tuple[int, int, int]], 
+            background_color_rgb: Tuple[int, int, int], 
+            jersey_color_rgb: Tuple[int, int, int], 
+            detections: List[Dict]
+        ) -> Dict:
         x1, y1, x2, y2 = bbox
         
         # Calculate bounding box size (normalized by frame size)
@@ -248,24 +263,8 @@ class RoleAssigner:
         bbox_width, bbox_height = x2 - x1, y2 - y1
         bbox_size = (bbox_width * bbox_height) / (frame_width * frame_height)
         
-        # Check if background is green (likely a field)
-        # Extract background from first cluster in the color detection
-        try:
-            cropped = frame[int(y1):int(y2), int(x1):int(x2)]
-            if cropped.size == 0:
-                return {"background_is_green": False, "bbox_has_no_overlap": True, "bbox_size": bbox_size}
-            
-            # Simple check for green background - average color in HSV space
-            hsv = cv2.cvtColor(cropped, cv2.COLOR_BGR2HSV)
-            avg_h, avg_s, avg_v = cv2.mean(hsv)[:3]
-            
-            # Green in HSV typically has hue around 60 (range 30-90), with some saturation
-            background_is_green = 30 <= avg_h <= 90 and avg_s > 40
-        except:
-            background_is_green = False
-        
         # Check for bbox overlap with other detections
-        bbox_has_no_overlap = True
+        bbox_has_overlap = False
         for other_detection in detections:
             if "bbox" not in other_detection or other_detection.get("class") != "person":
                 continue
@@ -280,13 +279,36 @@ class RoleAssigner:
             # Check for overlap
             # If there's any overlap between boxes
             if not (other_x2 < x1 or other_x1 > x2 or other_y2 < y1 or other_y1 > y2):
-                bbox_has_no_overlap = False
+                bbox_has_overlap = True
                 break
         
+        # Determine if background color is an outlier using DBSCAN
+        background_is_outlier = False
+        if len(all_background_colors_rgb) >= 3:  # Need at least 3 backgrounds to use DBSCAN effectively
+            # Convert all background colors to LAB for better perceptual comparison
+            background_labs = np.array([self._rgb_to_lab(bg) for bg in all_background_colors_rgb])
+            
+            # Find the index of the current background color
+            current_bg_idx = -1
+            for i, bg in enumerate(all_background_colors_rgb):
+                if bg == background_color_rgb:
+                    current_bg_idx = i
+                    break
+            
+            if current_bg_idx != -1:
+                # Apply DBSCAN clustering
+                # eps: maximum distance between samples to be considered in the same cluster
+                # min_samples: minimum number of samples to form a dense region
+                dbscan = DBSCAN(eps=20.0, min_samples=2)
+                clusters = dbscan.fit_predict(background_labs)
+                
+                # Points labeled as -1 are considered outliers by DBSCAN
+                background_is_outlier = bool(clusters[current_bg_idx] == -1)
+        
         return {
-            "background_is_green": background_is_green,
-            "bbox_has_no_overlap": bbox_has_no_overlap,
-            "bbox_size": bbox_size
+            "bbox_has_overlap": bbox_has_overlap,
+            "bbox_size": bbox_size,
+            "background_is_outlier": background_is_outlier
         }
     
     def process_detections(self, video_path: str, detections: List[Dict], output_dir: Optional[str] = None, store_results: bool = True) -> List[Dict]:
@@ -330,6 +352,8 @@ class RoleAssigner:
                           1, 
                           cv2.LINE_AA)
                 
+            # First pass, get all dominant color info
+            dominant_colors = {}
             for detection in frame_data['detections']:
                 if "bbox" not in detection or detection.get("class") != "person":
                     continue
@@ -337,41 +361,73 @@ class RoleAssigner:
                 bbox = detection["bbox"]
                 track_id = detection.get("track_id")
                 
-                jersey_color_rgb = self.get_dominant_color(
-                    frame, bbox, output_dir, frame_idx, track_id
+                background_color, jersey_color_rgb = self.get_dominant_color(
+                    frame, bbox, output_dir, frame_idx, track_id, visualize=False
                 )
                 
-                detection["raw_jersey_rgb"] = jersey_color_rgb
+                dominant_colors[track_id] = {
+                    "background_color": background_color,
+                    "jersey_color": jersey_color_rgb
+                }
+            
+            # Second pass, add color info and metadata to detections
+            for detection in frame_data['detections']:
+                if "bbox" not in detection or detection.get("class") != "person":
+                    continue
                 
+                bbox = detection["bbox"]
+                track_id = detection.get("track_id")
+
+                background_color_rgb = dominant_colors[track_id]["background_color"]
+                jersey_color_rgb = dominant_colors[track_id]["jersey_color"]
                 closest_color = self.find_closest_predefined_color(jersey_color_rgb)
-                detection["jersey_color"] = closest_color
+
+                color_info = {
+                    "raw_background_rgb": background_color_rgb,
+                    "raw_jersey_rgb": jersey_color_rgb,
+                    "closest_jersey_color": closest_color,
+                }
+
+                all_background_colors_rgb = [item["background_color"] for item in dominant_colors.values()]
                 
                 # Calculate and add jersey attributes
-                jersey_attributes = self._calculate_jersey_attributes(
-                    frame, bbox, jersey_color_rgb, frame_data['detections']
+                metadata = self._calculate_detections_metadata(
+                    frame, bbox, all_background_colors_rgb, background_color_rgb,jersey_color_rgb, frame_data['detections']
                 )
-                detection["jersey_attributes"] = jersey_attributes
+
+                final_color = closest_color
+                if metadata["background_is_outlier"]: 
+                    final_color = None
+                color_info["final_color"] = final_color
                 
+                detection["color_info"] = color_info
+                detection["metadata"] = metadata
+
                 if store_results:
                     x1, y1, x2, y2 = bbox
                     
-                    if closest_color in self.predefined_colors:
-                        color_rgb = self.predefined_colors[closest_color]
+                    if final_color in self.predefined_colors:
+                        color_rgb = self.predefined_colors[final_color]
                         color_bgr = (color_rgb[2], color_rgb[1], color_rgb[0])
+                        border_thickness = 2
+                    else:
+                        color_bgr = (0, 0, 0) # black
+                        border_thickness = 1
+
+                    cv2.rectangle(viz_frame, (x1, y1), (x2, y2), color_bgr, border_thickness)
+                    
+                    if track_id is not None:
+                        label = f"{track_id}"
+                        font_scale = 0.5
+                        font_thickness = 1
+                        font = cv2.FONT_HERSHEY_PLAIN
                         
-                        cv2.rectangle(viz_frame, (x1, y1), (x2, y2), color_bgr, 2)
-                        
-                        if track_id is not None:
-                            label = f"{track_id}"
-                            font_scale = 0.5
-                            font_thickness = 1
-                            font = cv2.FONT_HERSHEY_PLAIN
-                            
-                            cv2.putText(viz_frame, 
-                                      label, 
-                                      (x1, y2 + 15), 
-                                      font, font_scale, 
-                                      (0, 0, 0), font_thickness, cv2.LINE_AA)
+                        cv2.putText(viz_frame, 
+                                    label, 
+                                    (x1, y2 + 7), 
+                                    font, font_scale, 
+                                    (0, 0, 0), font_thickness, cv2.LINE_AA)
+
             
             if store_results:
                 out.write(viz_frame)
@@ -385,14 +441,6 @@ class RoleAssigner:
                 json.dump(detections, f, indent=2)
         
         return detections
-    
-    def run(self, video_path: str, detections_path: str, output_dir: Optional[str] = None, store_results: bool = True) -> List[Dict]:
-        with open(detections_path, 'r') as f:
-            detections = json.load(f)
-            
-        processed = self.process_detections(video_path, detections, output_dir, store_results)
-        
-        return processed
     
     def visualize_color_comparison(self, rgb_color: np.ndarray) -> None:
         """Visualize the input color and all predefined colors in 3D LAB space.
