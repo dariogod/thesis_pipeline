@@ -779,8 +779,347 @@ class RoleAssigner:
             
             with open(output_json_path, 'w') as f:
                 json.dump(detections, f, indent=2)
+
+        # Aggregate colors for each track ID and print the mapping
+        track_color_mapping = self.aggregate_track_colors(detections)
         
+        # Visualize the track colors in LAB space
+        if store_results:
+            self.visualize_track_colors_lab(track_color_mapping, output_dir)
+            self.cluster_tracks_and_assign_labels(track_color_mapping, output_dir)
+            self.visualize_clustered_tracks(track_color_mapping, output_dir)
+
         return detections
+    
+    def aggregate_track_colors(self, detections: List[Dict]) -> Dict[int, Dict]:
+        """Aggregate color information for each track ID across all frames.
+        
+        Args:
+            detections: List of detection data by frame
+            
+        Returns:
+            Dictionary mapping track_ids to their majority-voted colors
+        """
+        # Dictionary to store raw jersey colors for each track ID
+        track_raw_colors = {}
+        
+        # Go through all frames and collect raw jersey RGB values for each track
+        for frame_data in detections:
+            for detection in frame_data.get('detections', []):
+                if detection.get("class") != "person":
+                    continue
+                
+                track_id = detection.get("track_id")
+                if track_id is None:
+                    continue
+                
+                # Get the raw jersey color from the detection
+                color_info = detection.get("color_info", {})
+                raw_jersey_rgb = color_info.get("raw_jersey_rgb")
+                
+                if raw_jersey_rgb is not None:
+                    # Initialize track entry if not exists
+                    if track_id not in track_raw_colors:
+                        track_raw_colors[track_id] = []
+                    
+                    # Add this color to the list
+                    track_raw_colors[track_id].append(raw_jersey_rgb)
+        
+        # Average the colors in LAB space for each track
+        track_avg_colors = {}
+        for track_id, rgb_colors in track_raw_colors.items():
+            if not rgb_colors:
+                continue
+            
+            # Convert all RGB values to LAB
+            lab_colors = [self._rgb_to_lab(rgb) for rgb in rgb_colors]
+            
+            # Calculate the average LAB color
+            avg_lab = np.mean(lab_colors, axis=0)
+            
+            # Convert back to RGB for visualization and naming
+            avg_lab_reshaped = avg_lab.reshape(1, 1, 3)
+            bgr_color = cv2.cvtColor(np.uint8(avg_lab_reshaped), cv2.COLOR_Lab2BGR)
+            avg_rgb = tuple(reversed(bgr_color[0, 0].tolist()))
+            
+            # Find the closest predefined color
+            closest_color = self.find_closest_predefined_color(avg_rgb)
+            
+            # Store both the average RGB and the closest named color
+            track_avg_colors[track_id] = {
+                "avg_rgb": avg_rgb,
+                "avg_lab": avg_lab,
+                "closest_color": closest_color
+            }
+        
+        return track_avg_colors
+    
+    def visualize_track_colors_lab(self, track_colors: Dict[int, Dict], output_dir: Optional[str] = None) -> None:
+        """Create a scatter plot of track colors in LAB color space.
+        
+        Args:
+            track_colors: Dictionary mapping track_ids to color information
+            output_dir: Optional directory to save the visualization
+        """
+        fig = plt.figure(figsize=(12, 10))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Plot the predefined colors
+        for name, lab_color in self.predefined_colors_lab.items():
+            rgb_color = self.predefined_colors[name]
+            normalized_rgb = tuple(c/255 for c in rgb_color)
+            
+            a, b, L = lab_color[1], lab_color[2], lab_color[0]
+            
+            ax.scatter(a, b, L, c=[normalized_rgb], s=100, alpha=0.5, 
+                      marker='o', label=f"Ref: {name}")
+        
+        # Plot the track colors
+        for track_id, color_info in track_colors.items():
+            lab_color = color_info["avg_lab"]
+            rgb_color = color_info["avg_rgb"]
+            closest = color_info["closest_color"]
+            
+            normalized_rgb = tuple(c/255 for c in rgb_color)
+            a, b, L = lab_color[1], lab_color[2], lab_color[0]
+            
+            ax.scatter(a, b, L, c=[normalized_rgb], s=150, 
+                     marker='*', label=f"Track {track_id}: {closest}")
+            
+            # Add track ID label next to the point
+            ax.text(a, b, L, f" {track_id}", fontsize=9)
+        
+        ax.set_xlabel('a* (Green-Red)')
+        ax.set_ylabel('b* (Blue-Yellow)')
+        ax.set_zlabel('L* (Lightness)')
+        ax.set_title('Track Colors in LAB Space')
+        
+        
+        plt.tight_layout()
+        
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            plt.savefig(os.path.join(output_dir, 'track_colors_lab.png'), dpi=150, bbox_inches='tight')
+        
+        # Remove plt.show() to prevent visualization display
+        plt.close(fig)
+    
+    def cluster_tracks_and_assign_labels(self, track_colors: Dict[int, Dict], output_dir: Optional[str] = None) -> Dict[int, str]:
+        """Cluster track colors using K-means and assign team labels.
+        
+        Args:
+            track_colors: Dictionary mapping track_ids to color information
+            output_dir: Optional directory to save visualization and labels
+            
+        Returns:
+            Dictionary mapping track_ids to team labels
+        """
+        if not track_colors:
+            return {}
+        
+        # Extract track IDs and LAB colors
+        track_ids = list(track_colors.keys())
+        lab_colors = np.array([track_colors[track_id]["avg_lab"] for track_id in track_ids])
+        
+        # Determine optimal number of clusters using elbow method with MCSS
+        max_clusters = min(len(track_ids), 10)  # Cap at 10 clusters
+        mcss_scores = []
+        
+        for n_clusters in range(1, max_clusters + 1):
+            kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+            kmeans.fit(lab_colors)
+            
+            # Calculate Mean Cluster Sum of Squares (MCSS)
+            # This is the mean of the sum of squared distances of points to their assigned cluster center
+            cluster_centers = kmeans.cluster_centers_
+            labels = kmeans.labels_
+            
+            # Sum of squared distances for each point
+            sum_squared_dists = 0
+            for i, point in enumerate(lab_colors):
+                center = cluster_centers[labels[i]]
+                sum_squared_dists += np.sum((point - center) ** 2)
+            
+            # Mean of the sum of squared distances
+            mcss = sum_squared_dists / len(lab_colors)
+            mcss_scores.append(mcss)
+        
+        # Find elbow point
+        optimal_clusters = self._find_elbow_point(range(1, max_clusters + 1), mcss_scores)
+        
+        # If we couldn't determine optimal clusters or it's 1, use at least 2
+        if optimal_clusters is None or optimal_clusters < 2:
+            optimal_clusters = min(2, len(track_ids))
+        
+        # Visualize elbow curve if output_dir is provided
+        if output_dir:
+            self._visualize_elbow_curve(range(1, max_clusters + 1), mcss_scores, optimal_clusters, output_dir)
+        
+        # Apply K-means with the optimal number of clusters
+        kmeans = KMeans(n_clusters=optimal_clusters, n_init=10, random_state=42)
+        cluster_labels = kmeans.fit_predict(lab_colors)
+        
+        # Count samples in each cluster
+        unique_clusters, cluster_counts = np.unique(cluster_labels, return_counts=True)
+        
+        # Sort clusters by size (largest first)
+        sorted_clusters_with_idx = sorted(
+            [(cluster_idx, count, i) for i, (cluster_idx, count) in enumerate(zip(unique_clusters, cluster_counts))], 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        
+        # Map cluster indices to team labels
+        cluster_to_team = {}
+        for i, (cluster_idx, _, orig_idx) in enumerate(sorted_clusters_with_idx):
+            if i == 0:
+                cluster_to_team[cluster_idx] = "TEAM A"
+            elif i == 1:
+                cluster_to_team[cluster_idx] = "TEAM B"
+            else:
+                cluster_to_team[cluster_idx] = f"REF/GK {i-1}"
+        
+        # Assign team labels to track IDs
+        track_labels = {}
+        for i, track_id in enumerate(track_ids):
+            cluster_idx = cluster_labels[i]
+            team_label = cluster_to_team[cluster_idx]
+            track_labels[track_id] = team_label
+            
+            # Also store the cluster ID in the track_colors dict for visualization
+            track_colors[track_id]["cluster"] = int(cluster_idx)
+            track_colors[track_id]["team_label"] = team_label
+        
+        # Save labels to JSON file if output_dir is provided
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            with open(os.path.join(output_dir, 'labels.json'), 'w') as f:
+                json.dump(track_labels, f, indent=2)
+        
+        return track_labels
+    
+    def _find_elbow_point(self, k_values, mcss_scores):
+        """Find the elbow point in the MCSS curve using the maximum curvature method.
+        
+        Args:
+            k_values: List of k values (number of clusters)
+            mcss_scores: Corresponding MCSS scores
+            
+        Returns:
+            Optimal number of clusters
+        """
+        if len(k_values) < 3:
+            return k_values[0]
+        
+        # Normalize the data for better calculation
+        x = np.array(k_values)
+        y = np.array(mcss_scores)
+        
+        # Normalize coordinates
+        x_norm = (x - min(x)) / (max(x) - min(x))
+        y_norm = (y - min(y)) / (max(y) - min(y))
+        
+        # Calculate curvature
+        dx_dt = np.gradient(x_norm)
+        dy_dt = np.gradient(y_norm)
+        d2x_dt2 = np.gradient(dx_dt)
+        d2y_dt2 = np.gradient(dy_dt)
+        
+        curvature = np.abs(d2x_dt2 * dy_dt - dx_dt * d2y_dt2) / (dx_dt * dx_dt + dy_dt * dy_dt)**1.5
+        
+        # Find the point of maximum curvature
+        elbow_idx = np.argmax(curvature[1:-1]) + 1  # Skip first and last points
+        
+        return k_values[elbow_idx]
+    
+    def _visualize_elbow_curve(self, k_values, mcss_scores, optimal_k, output_dir):
+        """Visualize the elbow curve and the chosen optimal k.
+        
+        Args:
+            k_values: List of k values
+            mcss_scores: Corresponding MCSS scores
+            optimal_k: The chosen optimal number of clusters
+            output_dir: Directory to save the visualization
+        """
+        plt.figure(figsize=(10, 6))
+        plt.plot(k_values, mcss_scores, 'bo-')
+        plt.axvline(x=optimal_k, color='r', linestyle='--', label=f'Optimal k={optimal_k}')
+        plt.xlabel('Number of Clusters (k)')
+        plt.ylabel('Mean Cluster Sum of Squares (MCSS)')
+        plt.title('Elbow Method for Optimal k Selection')
+        plt.legend()
+        plt.grid(True)
+        
+        os.makedirs(output_dir, exist_ok=True)
+        plt.savefig(os.path.join(output_dir, 'elbow_curve.png'), dpi=150)
+        plt.close()
+    
+    def visualize_clustered_tracks(self, track_colors: Dict[int, Dict], output_dir: Optional[str] = None) -> None:
+        """Create a 3D scatter plot showing track colors with cluster labels.
+        
+        Args:
+            track_colors: Dictionary mapping track_ids to color information
+            output_dir: Optional directory to save the visualization
+        """
+        fig = plt.figure(figsize=(14, 12))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Set up colors for different teams
+        team_colors = {
+            "TEAM A": "red",
+            "TEAM B": "blue",
+            "REF/GK": "black"
+        }
+        
+        # Group tracks by cluster for the legend
+        teams = {}
+        for track_id, color_info in track_colors.items():
+            team_label = color_info.get("team_label", "Unknown")
+            if team_label not in teams:
+                teams[team_label] = []
+            teams[team_label].append(track_id)
+        
+        # Plot the track colors
+        for track_id, color_info in track_colors.items():
+            lab_color = color_info["avg_lab"]
+            rgb_color = color_info["avg_rgb"]
+            team_label = color_info.get("team_label", "Unknown")
+            
+            a, b, L = lab_color[1], lab_color[2], lab_color[0]
+            
+            # Use normalized RGB for the point color, but team color for marker edge
+            normalized_rgb = tuple(c/255 for c in rgb_color)
+            team_color = team_colors.get(team_label, "gray")
+            
+            ax.scatter(a, b, L, c=[normalized_rgb], s=150, 
+                      marker='*', edgecolors=team_color, linewidths=2)
+            
+            # Add track ID and team label
+            ax.text(a, b, L, f" {track_id} ({team_label})", fontsize=9)
+        
+        # Add team groups to legend
+        for team_label, track_ids in teams.items():
+            team_color = team_colors.get(team_label, "gray")
+            track_str = ", ".join(map(str, sorted(track_ids)))
+            ax.scatter([], [], [], c=team_color, marker='o', s=100, 
+                      label=f"{team_label}: Tracks {track_str}")
+        
+        ax.set_xlabel('a* (Green-Red)')
+        ax.set_ylabel('b* (Blue-Yellow)')
+        ax.set_zlabel('L* (Lightness)')
+        ax.set_title('Track Colors in LAB Space with Team Clustering')
+        
+        # Add legend
+        ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1))
+        
+        plt.tight_layout()
+        
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            plt.savefig(os.path.join(output_dir, 'label_clusters.png'), dpi=150, bbox_inches='tight')
+        
+        # Remove plt.show() to prevent visualization display
+        plt.close(fig)
     
     def visualize_color_comparison(self, rgb_color: np.ndarray) -> None:
         """Visualize the input color and all predefined colors in 3D LAB space.
@@ -829,4 +1168,5 @@ class RoleAssigner:
         ax.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
         
         plt.tight_layout()
-        plt.show() 
+        # Remove plt.show() to prevent visualization display
+        plt.close(fig) 
