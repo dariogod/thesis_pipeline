@@ -1,7 +1,7 @@
 import os
 import json
 from player_tracker import PlayerTracker
-from role_assignment import RoleAssigner
+from role_assignment_refactored import RoleAssigner
 
 action_name = "action_123_offence"
 input_path = f"input/{action_name}.mp4"
@@ -30,7 +30,7 @@ if os.path.exists(role_assignment_path):
     with open(role_assignment_path, "r") as f:
         role_assignment = json.load(f)
 else:
-    role_assignment = role_assigner.process_detections(input_path, player_detections, store_results=True)
+    role_assignment = role_assigner.process_detections(input_path, player_detections, store_results=True, visualize_colors=True)
 
 
 
