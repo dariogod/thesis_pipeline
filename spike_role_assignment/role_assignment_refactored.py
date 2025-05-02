@@ -776,9 +776,6 @@ class RoleAssigner:
         
         if store_results:
             out.release()
-            
-            with open(output_json_path, 'w') as f:
-                json.dump(detections, f, indent=2)
 
         # Aggregate colors for each track ID and print the mapping
         track_color_mapping = self.aggregate_track_colors(detections)
@@ -786,8 +783,22 @@ class RoleAssigner:
         # Visualize the track colors in LAB space
         if store_results:
             self.visualize_track_colors_lab(track_color_mapping, output_dir)
-            self.cluster_tracks_and_assign_labels(track_color_mapping, output_dir)
+    
+        track_labels = self.cluster_tracks_and_assign_labels(track_color_mapping, output_dir, store_results)
+
+        if store_results:
             self.visualize_clustered_tracks(track_color_mapping, output_dir)
+
+        # Add labels to detections
+        for frame_data in detections:
+            for detection in frame_data['detections']:
+                track_id = detection.get("track_id")
+                if track_id is not None:
+                    detection["output_label"] = track_labels[track_id]
+
+        if store_results:
+            with open(output_json_path, 'w') as f:
+                json.dump(detections, f, indent=2)
 
         return detections
     
@@ -904,7 +915,7 @@ class RoleAssigner:
         # Remove plt.show() to prevent visualization display
         plt.close(fig)
     
-    def cluster_tracks_and_assign_labels(self, track_colors: Dict[int, Dict], output_dir: Optional[str] = None) -> Dict[int, str]:
+    def cluster_tracks_and_assign_labels(self, track_colors: Dict[int, Dict], output_dir: Optional[str] = None, store_results: bool = True) -> Dict[int, str]:
         """Cluster track colors using K-means and assign team labels.
         
         Args:
@@ -952,7 +963,7 @@ class RoleAssigner:
             optimal_clusters = min(2, len(track_ids))
         
         # Visualize elbow curve if output_dir is provided
-        if output_dir:
+        if output_dir and store_results:
             self._visualize_elbow_curve(range(1, max_clusters + 1), mcss_scores, optimal_clusters, output_dir)
         
         # Apply K-means with the optimal number of clusters
@@ -991,7 +1002,7 @@ class RoleAssigner:
             track_colors[track_id]["team_label"] = team_label
         
         # Save labels to JSON file if output_dir is provided
-        if output_dir:
+        if output_dir and store_results:
             os.makedirs(output_dir, exist_ok=True)
             with open(os.path.join(output_dir, 'labels.json'), 'w') as f:
                 json.dump(track_labels, f, indent=2)
