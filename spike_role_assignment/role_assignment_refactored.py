@@ -767,10 +767,8 @@ class RoleAssigner:
         # Setup video writer if storing results
         if store_results:
             out, width, height, fps, total_frames = self._setup_video_writer(cap, color_assignments_video_path)
-            out_role_assignments, width, height, fps, total_frames = self._setup_video_writer(cap, role_assignments_video_path)
         else:
             out, total_frames = None, None
-            out_role_assignments, total_frames = None, None
         
         # Process each frame
         for frame_data in detections:
@@ -815,11 +813,120 @@ class RoleAssigner:
                 if track_id is not None:
                     detection["output_label"] = track_labels.get(track_id, "Unknown")
 
+        # Create the role assignments video
+        if store_results:
+            self._create_role_assignments_video(video_path, detections, track_labels, role_assignments_video_path)
+
         if store_results:
             with open(output_json_path, 'w') as f:
                 json.dump(detections, f, indent=2)
 
         return detections
+    
+    def _create_role_assignments_video(self, video_path: str, detections: List[Dict], track_labels: Dict[int, str], output_video_path: str) -> None:
+        """Create a video with team role labels under bounding boxes.
+        
+        Args:
+            video_path: Path to the input video
+            detections: List of detection data by frame
+            track_labels: Dictionary mapping track_ids to team labels
+            output_video_path: Path to save the output video
+        """
+        # Load video
+        cap = self._load_video(video_path)
+        
+        # Setup video writer using the existing method
+        out, width, height, fps, total_frames = self._setup_video_writer(cap, output_video_path)
+        
+        # Team color mapping for visualization
+        team_colors = {
+            "TEAM A": (255, 0, 0),  # Red
+            "TEAM B": (0, 0, 255),  # Blue
+            "REF/GK": (0, 0, 0),    # Black
+            "Unknown": (128, 128, 128)  # Gray
+        }
+        
+        # Process each frame
+        for frame_data in detections:
+            frame_idx = frame_data['frame_id']
+            frame = self._get_frame(cap, int(frame_idx))
+            
+            if frame is None:
+                continue
+            
+            # Create a copy for visualization
+            viz_frame = frame.copy()
+            
+            # Add frame counter to top left
+            frame_text = f"{frame_idx}/{total_frames}"
+            cv2.putText(viz_frame, 
+                     frame_text, 
+                     (10, 30), 
+                     cv2.FONT_HERSHEY_SIMPLEX, 
+                     0.5, 
+                     (0, 0, 0), 
+                     1, 
+                     cv2.LINE_AA)
+            
+            # Draw detections with team labels
+            for detection in frame_data['detections']:
+                if "bbox" not in detection or detection.get("class") != "person":
+                    continue
+                
+                bbox = detection["bbox"]
+                track_id = detection.get("track_id")
+                
+                if track_id is None:
+                    continue
+                
+                # Get team label for this track
+                team_label = track_labels.get(track_id, "Unknown")
+                
+                # Get bounding box coordinates
+                x1, y1, x2, y2 = bbox
+                
+                # Get color for this team
+                color_bgr = team_colors.get(team_label, (128, 128, 128))
+                
+                # Convert RGB to BGR for OpenCV
+                if not isinstance(color_bgr, tuple):
+                    color_bgr = tuple(color_bgr)
+                color_bgr = (color_bgr[2], color_bgr[1], color_bgr[0])
+                
+                # Draw bounding box
+                cv2.rectangle(viz_frame, (x1, y1), (x2, y2), color_bgr, 2)
+                
+                # Add track ID and team label
+                label_text = f"{track_id}: {team_label}"
+                font_scale = 0.5
+                font_thickness = 1
+                font = cv2.FONT_HERSHEY_PLAIN
+                
+                # Get text size to position it properly
+                text_size = cv2.getTextSize(label_text, font, font_scale, font_thickness)[0]
+                text_x = x1
+                text_y = y2 + text_size[1] + 5
+                
+                # Draw white background for text for better visibility
+                cv2.rectangle(viz_frame, 
+                            (text_x, y2), 
+                            (text_x + text_size[0], text_y + 5), 
+                            (255, 255, 255), 
+                            -1)
+                
+                # Draw text
+                cv2.putText(viz_frame, 
+                          label_text, 
+                          (text_x, text_y),
+                          font, font_scale, 
+                          color_bgr, font_thickness, cv2.LINE_AA)
+            
+            # Write frame to output video
+            out.write(viz_frame)
+        
+        # Clean up resources
+        cap.release()
+        out.release()
     
     def aggregate_track_colors(self, detections: List[Dict]) -> Dict[int, Dict]:
         """Aggregate color information for each track ID across all frames.
