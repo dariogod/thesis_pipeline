@@ -31,6 +31,8 @@ class RoleAssigner:
             "cyan_blue": (0, 154, 255)
         }
         self.predefined_colors_lab = {name: self._rgb_to_lab(rgb) for name, rgb in self.predefined_colors.items()}
+        # Dictionary to store cluster center colors after clustering
+        self.cluster_centers = {}
 
     def _load_video(self, video_path: str) -> cv2.VideoCapture:
         """Load a video file.
@@ -803,8 +805,9 @@ class RoleAssigner:
     
         track_labels = self.cluster_tracks_and_assign_labels(avg_track_colors, output_dir, store_results)
 
+        # Create the role assignments video
         if store_results:
-            self.visualize_clustered_tracks(avg_track_colors, output_dir)
+            self._create_role_assignments_video(video_path, detections, track_labels, role_assignments_video_path)
 
         # Add labels to detections
         for frame_data in detections:
@@ -812,10 +815,6 @@ class RoleAssigner:
                 track_id = detection.get("track_id")
                 if track_id is not None:
                     detection["output_label"] = track_labels.get(track_id, "Unknown")
-
-        # Create the role assignments video
-        if store_results:
-            self._create_role_assignments_video(video_path, detections, track_labels, role_assignments_video_path)
 
         if store_results:
             with open(output_json_path, 'w') as f:
@@ -838,11 +837,10 @@ class RoleAssigner:
         # Setup video writer using the existing method
         out, width, height, fps, total_frames = self._setup_video_writer(cap, output_video_path)
         
-        # Team color mapping for visualization
-        team_colors = {
+        # Default colors for teams in case cluster centers aren't available
+        default_team_colors = {
             "TEAM A": (255, 0, 0),  # Red
             "TEAM B": (0, 0, 255),  # Blue
-            "REF/GK": (0, 0, 0),    # Black
             "Unknown": (128, 128, 128)  # Gray
         }
         
@@ -882,19 +880,39 @@ class RoleAssigner:
                 # Get team label for this track
                 team_label = track_labels.get(track_id, "Unknown")
                 
+                # Get the cluster index stored in metadata
+                cluster_idx = None
+                if "metadata" in detection and detection.get("metadata", {}).get("cluster") is not None:
+                    cluster_idx = detection["metadata"]["cluster"]
+                
                 # Get bounding box coordinates
                 x1, y1, x2, y2 = bbox
                 
-                # Get color for this team
-                color_bgr = team_colors.get(team_label, (128, 128, 128))
+                # Get color based on the cluster
+                if cluster_idx is not None and cluster_idx in self.cluster_centers:
+                    rgb_color = self.cluster_centers[cluster_idx]["rgb"]
+                else:
+                    # For REF/GK classes, try to find the correct cluster by team label
+                    if team_label.startswith("REF/GK"):
+                        for cidx, info in self.cluster_centers.items():
+                            if info["team_label"] == team_label:
+                                rgb_color = info["rgb"]
+                                break
+                        else:
+                            # If no match found, use a default gray
+                            rgb_color = default_team_colors.get("Unknown")
+                    else:
+                        # For TEAM A or TEAM B, use default colors if needed
+                        rgb_color = default_team_colors.get(team_label, default_team_colors["Unknown"])
                 
                 # Convert RGB to BGR for OpenCV
-                if not isinstance(color_bgr, tuple):
-                    color_bgr = tuple(color_bgr)
-                color_bgr = (color_bgr[2], color_bgr[1], color_bgr[0])
+                if not isinstance(rgb_color, tuple):
+                    rgb_color = tuple(rgb_color)
+                color_bgr = (rgb_color[2], rgb_color[1], rgb_color[0])
                 
                 # Draw bounding box
-                cv2.rectangle(viz_frame, (x1, y1), (x2, y2), color_bgr, 2)
+                border_thickness = 2
+                cv2.rectangle(viz_frame, (x1, y1), (x2, y2), color_bgr, border_thickness)
                 
                 # Add track ID and team label
                 label_text = f"{track_id}: {team_label}"
@@ -1147,6 +1165,7 @@ class RoleAssigner:
         # Map cluster indices to team labels
         cluster_to_team = {}        
         # Assign the two largest clusters to TEAM A and TEAM B
+        ref_number = 1
         for i, (cluster_idx, _) in enumerate(sorted_clusters):
             if i == 0:
                 cluster_to_team[cluster_idx] = "TEAM A"
@@ -1154,29 +1173,98 @@ class RoleAssigner:
                 cluster_to_team[cluster_idx] = "TEAM B"
             else:
                 # Any additional non-outlier clusters beyond the top 2
-                cluster_to_team[cluster_idx] = f"REF/GK"
+                # Number them REF/GK 1, 2, 3, ...
+                cluster_to_team[cluster_idx] = f"REF/GK {ref_number}"
+                ref_number += 1
+                
+        # Handle outliers (-1 label)
+        # We'll group outliers by assigning a new cluster ID to each outlier
+        # Create a mapping of outlier tracks to new cluster IDs
+        outlier_tracks = []
+        for i, label in enumerate(best_labels):
+            if label == -1:
+                outlier_tracks.append(track_ids[i])
+        
+        # Assign new cluster IDs to outliers (continue from max_cluster_id + 1)
+        max_cluster_id = max(np.max(best_labels), -1)  # At least 0 or higher
+        outlier_cluster_map = {}
+        for i, track_id in enumerate(outlier_tracks):
+            new_cluster_id = max_cluster_id + 1 + i
+            outlier_cluster_map[track_id] = new_cluster_id
+            # Assign a unique REF/GK label
+            cluster_to_team[new_cluster_id] = f"REF/GK {ref_number}"
+            ref_number += 1
+
+        # Calculate the center color for each cluster
+        self.cluster_centers = {}
+        # First, handle the non-outlier clusters
+        for cluster_idx in np.unique(best_labels):
+            if cluster_idx == -1:
+                # Skip outliers, we'll handle them separately
+                continue
+                
+            # Get all points in this cluster
+            mask = best_labels == cluster_idx
+            cluster_lab_points = lab_colors[mask]
+            
+            # Calculate the mean LAB color
+            center_lab = np.mean(cluster_lab_points, axis=0)
+            
+            # Convert to RGB
+            center_rgb = self._lab_to_rgb(center_lab)
+            
+            # Store center colors
+            self.cluster_centers[cluster_idx] = {
+                "lab": center_lab,
+                "rgb": center_rgb,
+                "team_label": cluster_to_team.get(cluster_idx, "Unknown")
+            }
+        
+        # Now handle the outliers (each as its own cluster)
+        for i, track_id in enumerate(outlier_tracks):
+            # Get the assigned cluster ID for this outlier
+            cluster_idx = outlier_cluster_map[track_id]
+            
+            # Get the color for this outlier
+            lab_color = avg_track_colors[track_id]["avg_lab"]
+            rgb_color = avg_track_colors[track_id]["avg_rgb"]
+            
+            # Store it as a cluster center
+            self.cluster_centers[cluster_idx] = {
+                "lab": lab_color,
+                "rgb": rgb_color,
+                "team_label": cluster_to_team.get(cluster_idx, "Unknown")
+            }
         
         # Assign team labels to track IDs
         track_labels = {}
         for i, track_id in enumerate(track_ids):
-            cluster_idx = best_labels[i]
+            original_cluster_idx = best_labels[i]
             
-            # Handle outliers (cluster_idx = -1)
-            if cluster_idx == -1:
-                team_label = f"REF/GK"
+            # For non-outliers, use the original cluster ID
+            if original_cluster_idx != -1:
+                cluster_idx = original_cluster_idx
+                team_label = cluster_to_team.get(cluster_idx, "Unknown")
             else:
-                team_label = cluster_to_team.get(cluster_idx, f"REF/GK")
+                # For outliers, use the new cluster ID
+                cluster_idx = outlier_cluster_map[track_id]
+                team_label = cluster_to_team.get(cluster_idx, "Unknown")
             
             track_labels[track_id] = team_label
             
             # Also store the cluster ID in the track_colors dict for visualization
             avg_track_colors[track_id]["cluster"] = int(cluster_idx)
             avg_track_colors[track_id]["team_label"] = team_label
+            
+            # Add cluster center color reference
+            if cluster_idx in self.cluster_centers:
+                avg_track_colors[track_id]["cluster_center_lab"] = self.cluster_centers[cluster_idx]["lab"]
+                avg_track_colors[track_id]["cluster_center_rgb"] = self.cluster_centers[cluster_idx]["rgb"]
         
         # Visualize the clusters if requested
         if output_dir and store_results:
             try:
-                self._visualize_dbscan_clusters(lab_colors, best_labels, best_eps, min_samples, output_dir)
+                self._visualize_dbscan_clusters(lab_colors, best_labels, best_eps, min_samples, output_dir, outlier_cluster_map)
             except Exception as e:
                 print(f"Visualization error: {e}")
         
@@ -1191,7 +1279,7 @@ class RoleAssigner:
         
         return track_labels
     
-    def _visualize_dbscan_clusters(self, lab_colors, labels, eps, min_samples, output_dir):
+    def _visualize_dbscan_clusters(self, lab_colors, labels, eps, min_samples, output_dir, outlier_cluster_map):
         """Visualize DBSCAN clustering results.
         
         Args:
@@ -1200,6 +1288,7 @@ class RoleAssigner:
             eps: Epsilon value used for DBSCAN
             min_samples: Min samples value used for DBSCAN
             output_dir: Directory to save the visualization
+            outlier_cluster_map: Mapping of outlier tracks to new cluster IDs
         """
         plt.figure(figsize=(12, 10))
         
@@ -1209,19 +1298,29 @@ class RoleAssigner:
         # Get unique non-outlier clusters
         unique_clusters = np.unique(labels)
         
-        # Define colors for visualization
-        colors = plt.cm.tab10(np.linspace(0, 1, len(unique_clusters)))
+        # Create a track_id to index mapping for outliers
+        track_to_idx = {track_id: i for i, track_id in enumerate(outlier_cluster_map.keys())}
         
-        # Plot each cluster with a different color
-        for i, cluster in enumerate(unique_clusters):
+        # Plot each original (non-outlier) cluster
+        for cluster_idx in unique_clusters:
+            if cluster_idx == -1:
+                # Skip outliers, we'll handle them separately
+                continue
+                
             # Get points in this cluster
-            mask = labels == cluster
+            mask = labels == cluster_idx
             cluster_points = lab_colors[mask]
             
-            # Get cluster color (red for outliers, other colors for clusters)
-            color = 'red' if cluster == -1 else colors[i]
-            marker = 'x' if cluster == -1 else 'o'
-            label = 'Outliers (REF/GK)' if cluster == -1 else f'Cluster {cluster}'
+            # Get cluster information
+            if cluster_idx in self.cluster_centers:
+                cluster_info = self.cluster_centers[cluster_idx]
+                team_label = cluster_info["team_label"]
+                center_rgb = cluster_info["rgb"]
+                # Normalize RGB for matplotlib
+                color = tuple(c/255 for c in center_rgb)
+            else:
+                team_label = "Unknown Cluster"
+                color = (0.5, 0.5, 0.5)  # Gray
             
             # Plot the points
             ax.scatter(
@@ -1229,108 +1328,109 @@ class RoleAssigner:
                 cluster_points[:, 2],  # b* channel
                 cluster_points[:, 0],  # L* channel
                 color=color,
-                marker=marker,
+                marker='o',
                 s=100,
-                label=label
+                label=team_label
             )
+            
+            # Plot the cluster center with a star marker
+            center = self.cluster_centers[cluster_idx]["lab"]
+            ax.scatter(
+                center[1],  # a* channel
+                center[2],  # b* channel
+                center[0],  # L* channel
+                color=color,
+                marker='*',
+                s=300,
+                edgecolors='black'
+            )
+            
+            # Add text label at the center
+            ax.text(
+                center[1],
+                center[2],
+                center[0],
+                team_label,
+                fontsize=12,
+                weight='bold'
+            )
+        
+        # Now plot each outlier as its own cluster
+        outlier_mask = labels == -1
+        if np.any(outlier_mask):
+            # Get indices of outliers
+            outlier_indices = np.where(outlier_mask)[0]
+            
+            # Get the track IDs that correspond to these indices
+            outlier_track_ids = [list(outlier_cluster_map.keys())[i] for i in range(len(outlier_cluster_map))]
+            
+            # For each outlier, plot it with its assigned color and label
+            for i, track_id in enumerate(outlier_track_ids):
+                new_cluster_id = outlier_cluster_map[track_id]
+                
+                if new_cluster_id not in self.cluster_centers:
+                    continue
+                    
+                cluster_info = self.cluster_centers[new_cluster_id]
+                team_label = cluster_info["team_label"]
+                center_rgb = cluster_info["rgb"]
+                center_lab = cluster_info["lab"]
+                
+                # Normalize RGB for matplotlib
+                color = tuple(c/255 for c in center_rgb)
+                
+                # Plot the outlier point
+                # Find the index of this track_id in the original data
+                idx = outlier_indices[i] if i < len(outlier_indices) else None
+                if idx is not None:
+                    point = lab_colors[idx]
+                    
+                    ax.scatter(
+                        point[1],  # a* channel
+                        point[2],  # b* channel
+                        point[0],  # L* channel
+                        color=color,
+                        marker='x',
+                        s=100,
+                        label=team_label
+                    )
+                
+                # Plot the center (which is the same as the point for outliers)
+                ax.scatter(
+                    center_lab[1],  # a* channel
+                    center_lab[2],  # b* channel
+                    center_lab[0],  # L* channel
+                    color=color,
+                    marker='*',
+                    s=300,
+                    edgecolors='black'
+                )
+                
+                # Add text label
+                ax.text(
+                    center_lab[1],
+                    center_lab[2],
+                    center_lab[0],
+                    team_label,
+                    fontsize=12,
+                    weight='bold'
+                )
         
         # Add labels and title
         ax.set_xlabel('a* (Green-Red)')
         ax.set_ylabel('b* (Blue-Yellow)')
         ax.set_zlabel('L* (Lightness)')
-        ax.set_title(f'DBSCAN Clustering: eps={eps:.1f}, min_samples={min_samples}')
+        ax.set_title(f'Team Color Clustering: eps={eps:.1f}, min_samples={min_samples}')
         
-        # Add legend
-        ax.legend()
+        # Add legend with unique labels only
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys())
         
         # Save the plot
         os.makedirs(output_dir, exist_ok=True)
         plt.savefig(os.path.join(output_dir, 'dbscan_clusters.png'), dpi=150, bbox_inches='tight')
         plt.close()
-    
-    def visualize_clustered_tracks(self, avg_track_colors: Dict[int, Dict], output_dir: Optional[str] = None) -> None:
-        """Create a 3D scatter plot showing track colors with cluster labels.
-        
-        Args:
-            track_colors: Dictionary mapping track_ids to color information
-            output_dir: Optional directory to save the visualization
-        """
-        if not avg_track_colors:
-            print("No track colors to visualize")
-            return
-            
-        try:
-            fig = plt.figure(figsize=(14, 12))
-            ax = fig.add_subplot(111, projection='3d')
-            
-            # Set up colors for different teams
-            team_colors = {
-                "TEAM A": "red",
-                "TEAM B": "blue",
-                "REF/GK": "black",
-                "Unknown": "gray"
-            }
-            
-            # Group tracks by cluster for the legend
-            teams = {}
-            for track_id, color_info in avg_track_colors.items():
-                team_label = color_info.get("team_label", "Unknown")
-                if team_label not in teams:
-                    teams[team_label] = []
-                teams[team_label].append(track_id)
-            
-            # Plot the track colors
-            for track_id, color_info in avg_track_colors.items():
-                lab_color = color_info["avg_lab"]
-                rgb_color = color_info["avg_rgb"]
-                team_label = color_info.get("team_label", "Unknown")
-                
-                # Skip if NaN values are present
-                if np.isnan(lab_color).any():
-                    continue
-                    
-                a, b, L = lab_color[1], lab_color[2], lab_color[0]
-                
-                # Use normalized RGB for the point color, but team color for marker edge
-                normalized_rgb = tuple(c/255 for c in rgb_color)
-                team_color = team_colors.get(team_label, "gray")
-                
-                ax.scatter(a, b, L, c=[normalized_rgb], s=150, 
-                          marker='*', edgecolors=team_color, linewidths=1)
-                
-                # Add track ID and team label
-                ax.text(a, b, L, f" {track_id} ({team_label})", fontsize=9)
-            
-            # Add team groups to legend
-            for team_label, track_ids in teams.items():
-                team_color = team_colors.get(team_label, "gray")
-                track_str = ", ".join(map(str, sorted(track_ids)))
-                ax.scatter([], [], [], c=team_color, marker='o', s=100, 
-                          label=f"{team_label}: Tracks {track_str}")
-            
-            ax.set_xlabel('a* (Green-Red)')
-            ax.set_ylabel('b* (Blue-Yellow)')
-            ax.set_zlabel('L* (Lightness)')
-            ax.set_title('Track Colors in LAB Space with Team Clustering')
-            
-            # Add legend
-            ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1))
-            
-            plt.tight_layout()
-            
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-                plt.savefig(os.path.join(output_dir, 'label_clusters.png'), dpi=150, bbox_inches='tight')
-            
-            # Remove plt.show() to prevent visualization display
-            plt.close(fig)
-        except Exception as e:
-            print(f"Error visualizing clustered tracks: {e}")
-            # Ensure figure is closed even if error occurs
-            try:
-                plt.close(fig)
-            except:
-                pass
     
     def visualize_color_comparison(self, rgb_color: np.ndarray) -> None:
         """Visualize the input color and all predefined colors in 3D LAB space.
