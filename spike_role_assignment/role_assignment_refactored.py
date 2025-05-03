@@ -805,16 +805,22 @@ class RoleAssigner:
     
         track_labels = self.cluster_tracks_and_assign_labels(avg_track_colors, output_dir, store_results)
 
-        # Create the role assignments video
-        if store_results:
-            self._create_role_assignments_video(video_path, detections, track_labels, role_assignments_video_path)
-
-        # Add labels to detections
+        # Add labels and cluster information to detections
         for frame_data in detections:
             for detection in frame_data['detections']:
                 track_id = detection.get("track_id")
                 if track_id is not None:
                     detection["output_label"] = track_labels.get(track_id, "Unknown")
+                    
+                    # Add cluster information to metadata
+                    if track_id in avg_track_colors and "cluster" in avg_track_colors[track_id]:
+                        if "metadata" not in detection:
+                            detection["metadata"] = {}
+                        detection["metadata"]["cluster"] = avg_track_colors[track_id]["cluster"]
+
+        # Create the role assignments video
+        if store_results:
+            self._create_role_assignments_video(video_path, detections, track_labels, role_assignments_video_path)
 
         if store_results:
             with open(output_json_path, 'w') as f:
@@ -823,7 +829,7 @@ class RoleAssigner:
         return detections
     
     def _create_role_assignments_video(self, video_path: str, detections: List[Dict], track_labels: Dict[int, str], output_video_path: str) -> None:
-        """Create a video with team role labels under bounding boxes.
+        """Create a video with team role indicators around players' feet.
         
         Args:
             video_path: Path to the input video
@@ -855,7 +861,7 @@ class RoleAssigner:
             # Create a copy for visualization
             viz_frame = frame.copy()
             
-            # Add frame counter to top left
+            # Add frame counter to top left (keeping this minimal indicator)
             frame_text = f"{frame_idx}/{total_frames}"
             cv2.putText(viz_frame, 
                      frame_text, 
@@ -866,7 +872,7 @@ class RoleAssigner:
                      1, 
                      cv2.LINE_AA)
             
-            # Draw detections with team labels
+            # Draw oval indicators around players' feet
             for detection in frame_data['detections']:
                 if "bbox" not in detection or detection.get("class") != "person":
                     continue
@@ -877,67 +883,52 @@ class RoleAssigner:
                 if track_id is None:
                     continue
                 
-                # Get team label for this track
-                team_label = track_labels.get(track_id, "Unknown")
-                
-                # Get the cluster index stored in metadata
-                cluster_idx = None
-                if "metadata" in detection and detection.get("metadata", {}).get("cluster") is not None:
-                    cluster_idx = detection["metadata"]["cluster"]
-                
                 # Get bounding box coordinates
                 x1, y1, x2, y2 = bbox
                 
-                # Get color based on the cluster
+                # Calculate the position for the oval around feet
+                # The oval should be at the bottom of the bounding box
+                feet_y = y2  # Bottom of the bounding box
+                center_x = (x1 + x2) // 2  # Center of the bounding box
+                
+                # Calculate oval dimensions based on the width of the person
+                # The width of the oval is proportional to the width of the person
+                # but not too large or too small
+                box_width = x2 - x1
+                oval_width = int(box_width)  # 100% of person width
+                oval_height = int(oval_width * 0.4)  # Oval height is 40% of oval width
+                
+                # Get cluster index directly from detection metadata
+                cluster_idx = detection.get("metadata", {}).get("cluster")
+                
+                # Use the cluster center color if available
                 if cluster_idx is not None and cluster_idx in self.cluster_centers:
                     rgb_color = self.cluster_centers[cluster_idx]["rgb"]
                 else:
-                    # For REF/GK classes, try to find the correct cluster by team label
-                    if team_label.startswith("REF/GK"):
-                        for cidx, info in self.cluster_centers.items():
-                            if info["team_label"] == team_label:
-                                rgb_color = info["rgb"]
-                                break
-                        else:
-                            # If no match found, use a default gray
-                            rgb_color = default_team_colors.get("Unknown")
-                    else:
-                        # For TEAM A or TEAM B, use default colors if needed
-                        rgb_color = default_team_colors.get(team_label, default_team_colors["Unknown"])
+                    # Fallback to default color only if necessary
+                    team_label = track_labels.get(track_id, "Unknown")
+                    rgb_color = default_team_colors.get(team_label, default_team_colors["Unknown"])
                 
                 # Convert RGB to BGR for OpenCV
                 if not isinstance(rgb_color, tuple):
                     rgb_color = tuple(rgb_color)
                 color_bgr = (rgb_color[2], rgb_color[1], rgb_color[0])
                 
-                # Draw bounding box
-                border_thickness = 2
-                cv2.rectangle(viz_frame, (x1, y1), (x2, y2), color_bgr, border_thickness)
+                # Calculate oval parameters
+                angle_start = 0  # Starting angle in degrees
+                angle_end = 180  # Ending angle in degrees - 180 means half oval (open at the back)
                 
-                # Add track ID and team label
-                label_text = f"{track_id}: {team_label}"
-                font_scale = 0.5
-                font_thickness = 1
-                font = cv2.FONT_HERSHEY_PLAIN
-                
-                # Get text size to position it properly
-                text_size = cv2.getTextSize(label_text, font, font_scale, font_thickness)[0]
-                text_x = x1
-                text_y = y2 + text_size[1] + 5
-                
-                # Draw white background for text for better visibility
-                cv2.rectangle(viz_frame, 
-                            (text_x, y2), 
-                            (text_x + text_size[0], text_y + 5), 
-                            (255, 255, 255), 
-                            -1)
-                
-                # Draw text
-                cv2.putText(viz_frame, 
-                          label_text, 
-                          (text_x, text_y),
-                          font, font_scale, 
-                          color_bgr, font_thickness, cv2.LINE_AA)
+                # Draw the oval (half ellipse)
+                cv2.ellipse(
+                    viz_frame,
+                    (center_x, feet_y),  # Center position
+                    (oval_width // 2, oval_height // 2),  # Half width and height
+                    0,  # Angle of rotation
+                    angle_start,  # Starting angle
+                    angle_end,  # Ending angle
+                    color_bgr,  # Color
+                    2  # Line thickness
+                )
             
             # Write frame to output video
             out.write(viz_frame)
@@ -1238,6 +1229,8 @@ class RoleAssigner:
         
         # Assign team labels to track IDs
         track_labels = {}
+        track_clusters = {}  # Store cluster ID for each track
+        
         for i, track_id in enumerate(track_ids):
             original_cluster_idx = best_labels[i]
             
@@ -1251,6 +1244,7 @@ class RoleAssigner:
                 team_label = cluster_to_team.get(cluster_idx, "Unknown")
             
             track_labels[track_id] = team_label
+            track_clusters[track_id] = int(cluster_idx)
             
             # Also store the cluster ID in the track_colors dict for visualization
             avg_track_colors[track_id]["cluster"] = int(cluster_idx)
