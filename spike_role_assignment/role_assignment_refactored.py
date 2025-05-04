@@ -150,23 +150,35 @@ class RoleAssigner:
         
         return centers_lab, centers_rgb, centers_rgb_255, labels, counts
     
-    def _identify_background_jersey(self, centers_rgb: np.ndarray) -> Tuple[int, int]:
+    def _identify_background_jersey(self, centers_rgb_255: np.ndarray) -> Tuple[int, int]:
         """Identify which cluster is background (green) vs jersey.
         
         Args:
-            centers_rgb: RGB values of cluster centers
+            centers_rgb_255: RGB values of cluster centers
             
         Returns:
             Indices of background and jersey clusters
         """
-        # Calculate how "green" each cluster is
-        green_scores = []
-        for rgb in centers_rgb:
-            green_score = rgb[1] - (rgb[0] + rgb[2]) / 2
-            green_scores.append(green_score)
+        # Define a reference dark green color for football field (in RGB)
+        reference_green_rgb = (0, 100, 0)  # Dark green
+        reference_green_lab = self._rgb_to_lab(reference_green_rgb)
         
-        # Get index of the greenest cluster (background)
-        background_idx = np.argmax(green_scores)
+        # Convert RGB to LAB for better perceptual color comparison
+        centers_lab = np.array([self._rgb_to_lab(tuple(map(int, rgb))) for rgb in centers_rgb_255])
+        
+        # Calculate distance to reference green in LAB space
+        distances = []
+        for lab in centers_lab:
+            # Euclidean distance in LAB space
+            distance = np.sqrt(
+                (lab[0] - reference_green_lab[0])**2 +  # L* difference
+                (lab[1] - reference_green_lab[1])**2 +  # a* difference
+                (lab[2] - reference_green_lab[2])**2    # b* difference
+            )
+            distances.append(distance)
+        
+        # Get index of the cluster closest to reference green (background)
+        background_idx = np.argmin(distances)
         jersey_idx = 1 - background_idx  # The other cluster is the jersey
         
         return background_idx, jersey_idx
@@ -248,7 +260,7 @@ class RoleAssigner:
             centers_lab, centers_rgb, centers_rgb_255, labels, counts = self._cluster_colors(pixels)
             
             # Identify background and jersey clusters
-            background_idx, jersey_idx = self._identify_background_jersey(centers_rgb)
+            background_idx, jersey_idx = self._identify_background_jersey(centers_rgb_255)
             
             # Reorder clusters so background is first, jersey is second
             cluster_order = [background_idx, jersey_idx]
@@ -915,8 +927,8 @@ class RoleAssigner:
                 color_bgr = (rgb_color[2], rgb_color[1], rgb_color[0])
                 
                 # Calculate oval parameters
-                angle_start = 0  # Starting angle in degrees
-                angle_end = 180  # Ending angle in degrees - 180 means half oval (open at the back)
+                angle_start = -10  # Starting angle in degrees
+                angle_end = 190  # Ending angle in degrees - 180 means half oval (open at the back)
                 
                 # Draw the oval (half ellipse)
                 cv2.ellipse(
@@ -929,6 +941,27 @@ class RoleAssigner:
                     color_bgr,  # Color
                     2  # Line thickness
                 )
+                
+                # Add REF/GK text label underneath the oval for these special classes
+                team_label = track_labels.get(track_id, "Unknown")
+                if team_label.startswith("REF/GK"):
+                    text = "REF/GK"
+                    # Calculate text position (centered below the oval)
+                    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
+                    text_x = center_x - text_size[0] // 2
+                    text_y = feet_y + oval_height // 2 + 15  # Position below the oval
+                    
+                    # Add black text without background
+                    cv2.putText(
+                        viz_frame, 
+                        text, 
+                        (text_x, text_y), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 
+                        0.5,  # Font scale
+                        (0, 0, 0),  # Black text
+                        1,  # Line thickness
+                        cv2.LINE_AA
+                    )
             
             # Write frame to output video
             out.write(viz_frame)
