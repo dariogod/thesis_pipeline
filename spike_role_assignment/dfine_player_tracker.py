@@ -17,6 +17,109 @@ class DFinePlayerTracker:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         
+        # Tracking parameters
+        self.next_id = 0
+        self.tracks = {}  # Dictionary to store active tracks
+        self.max_age = 30  # Maximum number of frames a track can be inactive before being removed
+        self.iou_threshold = 0.3  # Minimum IoU to consider as a match
+        
+    def calculate_iou(self, box1, box2):
+        """Calculate IoU between two bounding boxes"""
+        # Extract coordinates
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        # Calculate area of each box
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        
+        # Calculate intersection coordinates
+        xi1 = max(x1_1, x1_2)
+        yi1 = max(y1_1, y1_2)
+        xi2 = min(x2_1, x2_2)
+        yi2 = min(y2_1, y2_2)
+        
+        # Calculate intersection area
+        w = max(0, xi2 - xi1)
+        h = max(0, yi2 - yi1)
+        intersection = w * h
+        
+        # Calculate IoU
+        union = area1 + area2 - intersection
+        iou = intersection / union if union > 0 else 0
+        
+        return iou
+    
+    def update_tracks(self, detections, class_name):
+        """Associate detections with existing tracks based on IoU"""
+        # If no tracks exist yet, create new tracks for all detections
+        if len(self.tracks.get(class_name, {})) == 0:
+            new_tracks = {}
+            for detection in detections:
+                track_id = self.next_id
+                self.next_id += 1
+                new_tracks[track_id] = {
+                    'bbox': detection['bbox'],
+                    'age': 0,
+                    'confidence': detection['confidence'],
+                    'last_seen': 0  # Frame counter when last seen
+                }
+                detection['track_id'] = track_id
+            self.tracks[class_name] = new_tracks
+            return
+        
+        # Calculate IoU between each detection and each track
+        matched_track_ids = []
+        matched_detection_indices = []
+        
+        for i, detection in enumerate(detections):
+            max_iou = -1
+            best_track_id = -1
+            
+            for track_id, track in self.tracks[class_name].items():
+                if track_id in matched_track_ids:
+                    continue
+                
+                iou = self.calculate_iou(detection['bbox'], track['bbox'])
+                if iou > max_iou and iou >= self.iou_threshold:
+                    max_iou = iou
+                    best_track_id = track_id
+            
+            if best_track_id != -1:
+                matched_track_ids.append(best_track_id)
+                matched_detection_indices.append(i)
+                detections[i]['track_id'] = best_track_id
+                # Update track information
+                self.tracks[class_name][best_track_id]['bbox'] = detection['bbox']
+                self.tracks[class_name][best_track_id]['age'] = 0
+                self.tracks[class_name][best_track_id]['confidence'] = detection['confidence']
+                self.tracks[class_name][best_track_id]['last_seen'] = 0
+        
+        # Create new tracks for unmatched detections
+        for i, detection in enumerate(detections):
+            if i not in matched_detection_indices:
+                track_id = self.next_id
+                self.next_id += 1
+                self.tracks[class_name][track_id] = {
+                    'bbox': detection['bbox'],
+                    'age': 0,
+                    'confidence': detection['confidence'],
+                    'last_seen': 0
+                }
+                detection['track_id'] = track_id
+        
+        # Update age of all tracks and remove old ones
+        tracks_to_remove = []
+        for track_id in self.tracks[class_name]:
+            if track_id not in matched_track_ids:
+                self.tracks[class_name][track_id]['age'] += 1
+                self.tracks[class_name][track_id]['last_seen'] += 1
+                if self.tracks[class_name][track_id]['age'] > self.max_age:
+                    tracks_to_remove.append(track_id)
+        
+        for track_id in tracks_to_remove:
+            del self.tracks[class_name][track_id]
+    
     def track_players(self, input_path, output_dir=None, store_results=True):
         # Open the input video
         cap = cv2.VideoCapture(input_path)
@@ -55,6 +158,11 @@ class DFinePlayerTracker:
         # D-FINE is pre-trained on COCO where 'person' is class 0 and 'sports ball' is class 32
         relevant_classes = {0: 'person', 32: 'sports ball'}
         
+        # Initialize tracking for each class
+        for class_name in relevant_classes.values():
+            if class_name not in self.tracks:
+                self.tracks[class_name] = {}
+        
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -80,6 +188,9 @@ class DFinePlayerTracker:
             
             frame_detections = []
             
+            # Group detections by class for tracking
+            class_detections = {class_name: [] for class_name in relevant_classes.values()}
+            
             # Extract detection results
             for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
                 cls_id = label.item()
@@ -92,36 +203,21 @@ class DFinePlayerTracker:
                     x1, y1, x2, y2 = map(int, box.cpu().numpy())
                     conf = float(score.cpu().numpy())
                     
-                    # D-FINE doesn't provide tracking IDs, so we'll use detection index as a placeholder
-                    # In a real application, you might want to integrate a dedicated tracker
-                    track_id = len(frame_detections)
-                    
-                    if store_results:
-                        # Different colors for different classes
-                        color = (0, 0, 0) if cls_id == 0 else (255, 255, 255)  # Black for person, white for ball
-                        
-                        # Draw bounding box
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
-
-                        # Draw label and track ID
-                        label_text = f"{track_id}"
-                        font_scale = 0.5
-                        font_thickness = 1
-                        font = cv2.FONT_HERSHEY_PLAIN
-                        cv2.putText(frame, 
-                                    label_text, 
-                                    (x1, y2 + 7), 
-                                    font, font_scale, 
-                                    (0, 0, 0), font_thickness, cv2.LINE_AA)
-                    
-                    # Store detection data
+                    # Create detection object (track_id will be assigned by the tracker)
                     detection = {
                         'bbox': [x1, y1, x2, y2],
                         'confidence': float(conf),
-                        'track_id': track_id,
+                        'track_id': None,  # Will be assigned by tracker
                         'class': class_name,
                     }
-                    frame_detections.append(detection)
+                    
+                    # Add to class-specific detection list
+                    class_detections[class_name].append(detection)
+            
+            # Update tracks for each class
+            for class_name, detections in class_detections.items():
+                self.update_tracks(detections, class_name)
+                frame_detections.extend(detections)
             
             # Save detection data for this frame
             all_detections.append({
@@ -130,6 +226,29 @@ class DFinePlayerTracker:
             })
             
             if store_results:
+                # Draw detections on frame
+                for detection in frame_detections:
+                    x1, y1, x2, y2 = detection['bbox']
+                    track_id = detection['track_id']
+                    class_name = detection['class']
+                    
+                    # Different colors for different classes
+                    color = (0, 0, 0) if class_name == 'person' else (255, 255, 255)
+                    
+                    # Draw bounding box
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
+                    
+                    # Draw track ID
+                    label_text = f"{track_id}"
+                    font_scale = 1.0  # Increased from 0.5 to 1.0
+                    font_thickness = 2  # Increased from 1 to 2
+                    font = cv2.FONT_HERSHEY_PLAIN
+                    cv2.putText(frame, 
+                                label_text, 
+                                (x1, y2 + 20),  # Increased y-offset from 15 to 20 to accommodate larger text
+                                font, font_scale, 
+                                (0, 0, 255), font_thickness, cv2.LINE_AA)
+                
                 # Write frame to output video
                 out.write(frame)
                 
