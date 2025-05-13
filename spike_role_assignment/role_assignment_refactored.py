@@ -3,7 +3,7 @@ import numpy as np
 from sklearn.cluster import KMeans, DBSCAN
 import json
 import os
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 import matplotlib.pyplot as plt
 from skimage import color
 import matplotlib.gridspec as gridspec
@@ -11,14 +11,15 @@ from mpl_toolkits.mplot3d import Axes3D
 
 
 class RoleAssigner:
-    def __init__(self):
+    def __init__(self, use_predefined: bool = False):
+        self.use_predefined = use_predefined
         self.predefined_colors = {
             "red": (255, 0, 0),
             "blue": (0, 0, 255),
             "green": (0, 128, 0),
             "light_green": (144, 238, 144),
             "yellow": (255, 255, 0),
-            "white": (255, 255, 255),
+            "white": (215, 215, 215),
             "black": (0, 0, 0),
             "orange": (255, 165, 0),
             "purple": (128, 0, 128),
@@ -685,7 +686,13 @@ class RoleAssigner:
 
             background_color_rgb = dominant_colors[track_id]["background_color"]
             jersey_color_rgb = dominant_colors[track_id]["jersey_color"]
-            closest_color = self.find_closest_predefined_color(jersey_color_rgb)
+
+            if self.use_predefined:
+                closest_color = self.find_closest_predefined_color(jersey_color_rgb)
+                final_color = closest_color
+            else:
+                closest_color = None
+                final_color = jersey_color_rgb
 
             color_info = {
                 "raw_background_rgb": background_color_rgb,
@@ -701,7 +708,6 @@ class RoleAssigner:
                 jersey_color_rgb, frame_data['detections']
             )
 
-            final_color = closest_color
             if metadata["background_is_outlier"]: 
                 final_color = None
             color_info["final_color"] = final_color
@@ -717,7 +723,7 @@ class RoleAssigner:
             viz_frame: np.ndarray,
             bbox: List[int],
             track_id: int,
-            final_color: Optional[str]
+            final_color: Optional[Union[str, Tuple[int, int, int]]]
         ) -> None:
         """Draw visualization for a detection on the frame.
         
@@ -725,13 +731,21 @@ class RoleAssigner:
             viz_frame: Frame to draw on
             bbox: Bounding box coordinates
             track_id: Track ID to label the box
-            final_color: Final assigned color name
+            final_color: Final assigned color (either color name or RGB tuple)
         """
         x1, y1, x2, y2 = bbox
         
-        if final_color in self.predefined_colors:
+        if final_color is None:
+            color_bgr = (0, 0, 0)  # black
+            border_thickness = 1
+        elif isinstance(final_color, str) and final_color in self.predefined_colors:
+            # Handle predefined color name
             color_rgb = self.predefined_colors[final_color]
             color_bgr = (color_rgb[2], color_rgb[1], color_rgb[0])
+            border_thickness = 2
+        elif isinstance(final_color, (tuple, list)) and len(final_color) == 3:
+            # Handle raw RGB color
+            color_bgr = (final_color[2], final_color[1], final_color[0])
             border_thickness = 2
         else:
             color_bgr = (0, 0, 0)  # black
@@ -980,10 +994,9 @@ class RoleAssigner:
             Dictionary mapping track_ids to their majority-voted colors
         """
         # Dictionary to store raw jersey colors for each track ID
-        track_final_colors = {}
-        track_raw_colors = {}
+        track_colors = {}
         
-        # Go through all frames and collect raw jersey RGB values for each track
+        # Go through all frames and collect jersey RGB values for each track
         for frame_data in detections:
             for detection in frame_data.get('detections', []):
                 if detection.get("class") != "person":
@@ -992,38 +1005,34 @@ class RoleAssigner:
                 track_id = detection.get("track_id")
                 if track_id is None:
                     continue
-                if track_id not in track_final_colors:
-                    track_final_colors[track_id] = []
-                if track_id not in track_raw_colors:
-                    track_raw_colors[track_id] = []
+                if track_id not in track_colors:
+                    track_colors[track_id] = []
 
-                final_color = detection["color_info"]["final_color"]
-                if final_color:
-                    final_color_lab = self.predefined_colors_lab[final_color]
-                    track_final_colors[track_id].append(final_color_lab)
-                raw_color = detection["color_info"]["raw_jersey_rgb"]
-                track_raw_colors[track_id].append(raw_color)
+                if self.use_predefined:
+                    # Use predefined colors if enabled
+                    final_color = detection["color_info"]["final_color"]
+                    if final_color:
+                        final_color_lab = self.predefined_colors_lab[final_color]
+                        track_colors[track_id].append(final_color_lab)
+                else:
+                    # Use raw colors if predefined colors are disabled
+                    raw_color = detection["color_info"]["raw_jersey_rgb"]
+                    track_colors[track_id].append(raw_color)
 
         avg_track_colors = {}
-        for track_id, final_colors in track_final_colors.items():
-            if not final_colors:
-                raw_colors_rgb = track_raw_colors[track_id]
-                if not raw_colors_rgb:
-                    print("WARNING NO RAW COLORS FOUND FOR TRACK ID: ", track_id)
-                    continue
-                raw_colors_lab = [self._rgb_to_lab(color) for color in raw_colors_rgb]
-
-                    
-                avg_lab = np.mean(raw_colors_lab, axis=0)
-                avg_rgb = self._lab_to_rgb(avg_lab)
-                avg_track_colors[track_id] = {
-                    "avg_lab": avg_lab,
-                    "avg_rgb": avg_rgb,
-                }
+        for track_id, colors in track_colors.items():
+            if not colors:
+                print("WARNING NO COLORS FOUND FOR TRACK ID: ", track_id)
                 continue
-            
-            # Calculate the average LAB color
-            avg_lab = np.mean(final_colors, axis=0)
+
+            if self.use_predefined:
+                # Colors are already in LAB space
+                avg_lab = np.mean(colors, axis=0)
+            else:
+                # Convert raw RGB colors to LAB space
+                colors_lab = [self._rgb_to_lab(color) for color in colors]
+                avg_lab = np.mean(colors_lab, axis=0)
+
             avg_rgb = self._lab_to_rgb(avg_lab)
             avg_track_colors[track_id] = {
                 "avg_lab": avg_lab,
@@ -1045,16 +1054,16 @@ class RoleAssigner:
             
         try:
             fig = plt.figure(figsize=(12, 10))
-            ax = fig.add_subplot(111, projection='3d')
+            ax = fig.add_subplot(111)  # Changed from 3D to 2D
             
             # Plot the predefined colors
             for name, lab_color in self.predefined_colors_lab.items():
                 rgb_color = self.predefined_colors[name]
                 normalized_rgb = tuple(c/255 for c in rgb_color)
                 
-                a, b, L = lab_color[1], lab_color[2], lab_color[0]
+                a, b = lab_color[1], lab_color[2]  # Only use a* and b* channels
                 
-                ax.scatter(a, b, L, c=[normalized_rgb], s=100, alpha=0.5, 
+                ax.scatter(a, b, c=[normalized_rgb], s=100, alpha=0.5, 
                           marker='o', label=f"Ref: {name}")
             
             # Plot the track colors
@@ -1067,19 +1076,17 @@ class RoleAssigner:
                     continue
                     
                 normalized_rgb = tuple(c/255 for c in rgb_color)
-                a, b, L = lab_color[1], lab_color[2], lab_color[0]
+                a, b = lab_color[1], lab_color[2]  # Only use a* and b* channels
                 
-                ax.scatter(a, b, L, c=[normalized_rgb], s=150, 
+                ax.scatter(a, b, c=[normalized_rgb], s=150, 
                          marker='*', label=f"Track {track_id}")
                 
                 # Add track ID label next to the point
-                ax.text(a, b, L, f" {track_id}", fontsize=9)
+                ax.text(a, b, f" {track_id}", fontsize=9)
             
             ax.set_xlabel('a* (Green-Red)')
             ax.set_ylabel('b* (Blue-Yellow)')
-            ax.set_zlabel('L* (Lightness)')
-            ax.set_title('Track Colors in LAB Space')
-            
+            ax.set_title('Track Colors in LAB Space (a*-b* plane)')
             
             plt.tight_layout()
             
@@ -1087,7 +1094,6 @@ class RoleAssigner:
                 os.makedirs(output_dir, exist_ok=True)
                 plt.savefig(os.path.join(output_dir, 'track_colors_lab.png'), dpi=150, bbox_inches='tight')
             
-            # Remove plt.show() to prevent visualization display
             plt.close(fig)
         except Exception as e:
             print(f"Error visualizing track colors: {e}")
@@ -1115,6 +1121,9 @@ class RoleAssigner:
         track_ids = list(avg_track_colors.keys())
         lab_colors = np.array([avg_track_colors[track_id]["avg_lab"] for track_id in track_ids])
         
+        # Only use a* and b* channels for clustering
+        ab_colors = lab_colors[:, 1:]  # Take only a* and b* channels
+        
         # Check if we have enough valid data for clustering
         if len(track_ids) < 2:
             # Not enough data for meaningful clustering
@@ -1138,7 +1147,7 @@ class RoleAssigner:
             # Dynamically adjust eps until we get exactly 2 main clusters
             while eps >= min_eps:
                 dbscan = DBSCAN(eps=eps, min_samples=min_samples)
-                labels = dbscan.fit_predict(lab_colors)
+                labels = dbscan.fit_predict(ab_colors)  # Use ab_colors instead of lab_colors
                 
                 # Count non-outlier clusters (clusters not labeled as -1)
                 unique_clusters = np.unique(labels)
@@ -1165,8 +1174,8 @@ class RoleAssigner:
                     best_labels = labels
                 else:
                     # Fallback to K-means if DBSCAN couldn't find multiple clusters
-                    kmeans = KMeans(n_clusters=min(2, len(lab_colors)), n_init=10, random_state=42)
-                    best_labels = kmeans.fit_predict(lab_colors)
+                    kmeans = KMeans(n_clusters=min(2, len(ab_colors)), n_init=10, random_state=42)
+                    best_labels = kmeans.fit_predict(ab_colors)  # Use ab_colors instead of lab_colors
                     # All points assigned to clusters in K-means (no -1 labels)
         
         except Exception as e:
@@ -1319,8 +1328,8 @@ class RoleAssigner:
         """
         plt.figure(figsize=(12, 10))
         
-        # Create a 3D plot
-        ax = plt.subplot(111, projection='3d')
+        # Create a 2D plot
+        ax = plt.subplot(111)
         
         # Get unique non-outlier clusters
         unique_clusters = np.unique(labels)
@@ -1349,11 +1358,10 @@ class RoleAssigner:
                 team_label = "Unknown Cluster"
                 color = (0.5, 0.5, 0.5)  # Gray
             
-            # Plot the points
+            # Plot the points (only a* and b* channels)
             ax.scatter(
                 cluster_points[:, 1],  # a* channel
                 cluster_points[:, 2],  # b* channel
-                cluster_points[:, 0],  # L* channel
                 color=color,
                 marker='o',
                 s=100,
@@ -1365,7 +1373,6 @@ class RoleAssigner:
             ax.scatter(
                 center[1],  # a* channel
                 center[2],  # b* channel
-                center[0],  # L* channel
                 color=color,
                 marker='*',
                 s=300,
@@ -1376,7 +1383,6 @@ class RoleAssigner:
             ax.text(
                 center[1],
                 center[2],
-                center[0],
                 team_label,
                 fontsize=12,
                 weight='bold'
@@ -1415,7 +1421,6 @@ class RoleAssigner:
                     ax.scatter(
                         point[1],  # a* channel
                         point[2],  # b* channel
-                        point[0],  # L* channel
                         color=color,
                         marker='x',
                         s=100,
@@ -1426,7 +1431,6 @@ class RoleAssigner:
                 ax.scatter(
                     center_lab[1],  # a* channel
                     center_lab[2],  # b* channel
-                    center_lab[0],  # L* channel
                     color=color,
                     marker='*',
                     s=300,
@@ -1437,7 +1441,6 @@ class RoleAssigner:
                 ax.text(
                     center_lab[1],
                     center_lab[2],
-                    center_lab[0],
                     team_label,
                     fontsize=12,
                     weight='bold'
@@ -1446,7 +1449,6 @@ class RoleAssigner:
         # Add labels and title
         ax.set_xlabel('a* (Green-Red)')
         ax.set_ylabel('b* (Blue-Yellow)')
-        ax.set_zlabel('L* (Lightness)')
         ax.set_title(f'Team Color Clustering: eps={eps:.1f}, min_samples={min_samples}')
         
         # Add legend with unique labels only
