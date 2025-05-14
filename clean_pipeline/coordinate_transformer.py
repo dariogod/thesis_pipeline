@@ -115,15 +115,15 @@ class CoordinateTransformer:
                 homography_data[str(processed_frames)] = M.tolist()
                 
                 # Save warped image if storing results
-                if store_results:
+                # if store_results:
                 #     image_filename = f"frame_{processed_frames:06d}.jpg"
                 #     warped_image_path = os.path.join(warped_images_dir, image_filename)
                 #     cv2.imwrite(warped_image_path, warped_image)
                     
                 #     # Save high-res warped image
-                    warped_image_high_res = self.transform_image(M, frame, (540, 960))
-                    warped_image_high_res_path = os.path.join(warped_images_dir, f"frame_{processed_frames:06d}_high_res.jpg")
-                    cv2.imwrite(warped_image_high_res_path, warped_image_high_res)
+                #     warped_image_high_res = self.transform_image(M, frame, (540, 960))
+                #     warped_image_high_res_path = os.path.join(warped_images_dir, f"frame_{processed_frames:06d}_high_res.jpg")
+                #     cv2.imwrite(warped_image_high_res_path, warped_image_high_res)
             else:
                 # Use the last calculated homography matrix
                 M = last_M if last_M is not None else self.perspective_transform.homography_matrix(frame)[0]
