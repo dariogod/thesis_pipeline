@@ -50,6 +50,14 @@ spike_role_assignment/dfine_player_tracker_results/
 spike_role_assignment/role_assignment_results/
 spike_role_assignment/models/
 
+clean_pipeline/color_assigner_results/
+clean_pipeline/yolo_player_tracker_results/
+clean_pipeline/d_fine_player_tracker_results/
+clean_pipeline/input/
+clean_pipeline/models/
+clean_pipeline/coordinate_transformer_results/
+clean_pipeline/role_assigner_results/
+
 # output
 output/
 
