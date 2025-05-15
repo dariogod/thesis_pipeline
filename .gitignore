@@ -57,6 +57,7 @@ clean_pipeline/input/
 clean_pipeline/models/
 clean_pipeline/coordinate_transformer_results/
 clean_pipeline/role_assigner_results/
+clean_pipeline/minimap_visualizer_results/
 
 # output
 output/

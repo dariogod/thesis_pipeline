@@ -143,10 +143,12 @@ class CoordinateTransformer:
                         
                         # Transform coordinates to minimap
                         minimap_coords = self.transform_matrix(M, (center_x, center_y), (h, w), (gt_h, gt_w))
-                        
-                        # Add minimap coordinates to detection
-                        detection.minimap_coordinates = MinimapCoordinates(x=minimap_coords[0], y=minimap_coords[1])
-                        
+
+                        # Check if coordinates are within bounds
+                        if 0 <= minimap_coords[0] < gt_w and 0 <= minimap_coords[1] < gt_h:
+                            # Add minimap coordinates to detection
+                            detection.minimap_coordinates = MinimapCoordinates(x=minimap_coords[0], y=minimap_coords[1], x_max=gt_w, y_max=gt_h)
+                            
                         # Draw on visualization if storing results
                         if store_results and 0 <= minimap_coords[0] < gt_w and 0 <= minimap_coords[1] < gt_h:
                             # Draw player as circle, color based on team

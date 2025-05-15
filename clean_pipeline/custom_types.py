@@ -29,6 +29,8 @@ class TrackInfo(BaseModel):
 class MinimapCoordinates(BaseModel):
     x: int
     y: int
+    x_max: int
+    y_max: int
 
 class Detection(BaseModel):
     """Represents a single object detection"""
@@ -38,7 +40,7 @@ class Detection(BaseModel):
     track_id: Optional[int] = None
     class_name: Literal["person", "sports ball"]
     jersey_color: RGBColor255 | None = None
-    role: Literal["TEAM A", "TEAM B", "REF/GK", "REF", "GK", "UNK"] | None = None
+    role: Literal["TEAM A", "TEAM B", "REF/GK", "REF", "GK", "UNK", "OOB"] | None = None
     minimap_coordinates: MinimapCoordinates | None = None
 
 class FrameDetections(BaseModel):
@@ -48,4 +50,4 @@ class FrameDetections(BaseModel):
 
 class TrackRole(BaseModel):
     track_id: int
-    role: Literal["TEAM A", "TEAM B", "REF/GK", "REF", "GK", "UNK"]
+    role: Literal["TEAM A", "TEAM B", "REF/GK", "REF", "GK", "UNK", "OOB"]
