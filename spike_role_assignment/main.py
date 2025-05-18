@@ -2,6 +2,7 @@ import os
 import json
 from player_tracker import PlayerTracker
 from role_assignment_refactored import RoleAssigner
+from dfine_player_tracker import DFinePlayerTracker
 
 def process_action(action_name: str, input_path: str):
     # Player Detection
@@ -29,24 +30,28 @@ def process_action(action_name: str, input_path: str):
 
 
 # Modules
-player_tracker = PlayerTracker()
+# player_tracker = PlayerTracker()
+player_tracker = DFinePlayerTracker()
 role_assigner = RoleAssigner()
 
 for action_path in os.listdir("input"):
-    if action_path == "SNGS-173_video.mp4":
+    if not action_path.startswith("action_"):
         continue
 
     input_path = f"input/{action_path}"
     action_name = action_path.split(".")[0]
 
     action_id = int(action_name.split("_")[1])
-    if action_id != 123:
+    if action_id > 200:
+        continue
+
+    if action_id != 0:
         continue
 
     print(f"Processing action {action_name}")
     process_action(action_name, input_path)
 
 
-# action_name = "SNGS-173_video"
+# action_name = "SNGS-007_video_cut"
 # input_path = f"input/{action_name}.mp4"
 # process_action(action_name, input_path)

@@ -605,37 +605,31 @@ class RoleAssigner:
                       1, 
                       cv2.LINE_AA)
         
-        # First pass, get all dominant color info
-        dominant_colors = self._extract_dominant_colors(
-            frame, frame_data, output_dir, frame_idx, visualize_colors
-        )
+        # Step 1: Extract ROIs for all valid detections
+        extracted_rois = self._extract_all_rois(frame, frame_data)
         
-        # Second pass, add color info and metadata to detections
-        self._add_color_metadata_to_detections(
-            frame, frame_data, dominant_colors, store_results, viz_frame
-        )
+        # Step 2: Find dominant colors for all ROIs
+        dominant_colors = self._get_dominant_colors_for_rois(frame, extracted_rois, output_dir, frame_idx, visualize_colors)
+        
+        # Step 3: Calculate metadata including ROI overlaps
+        detection_metadata = self._calculate_all_detection_metadata(frame, frame_data, extracted_rois, dominant_colors)
+        
+        # Step 4: Add color and metadata to detections
+        self._add_color_metadata_to_detections(frame, frame_data, dominant_colors, detection_metadata, store_results, viz_frame)
     
-    def _extract_dominant_colors(
-            self,
-            frame: np.ndarray,
-            frame_data: Dict,
-            output_dir: Optional[str],
-            frame_idx: int,
-            visualize_colors: bool
-        ) -> Dict[int, Dict]:
-        """Extract dominant colors for all detections in a frame.
+    def _extract_all_rois(self, frame: np.ndarray, frame_data: Dict) -> Dict[int, Dict]:
+        """Extract ROIs for all valid detections in a frame.
         
         Args:
             frame: Video frame
             frame_data: Frame data including detections
-            output_dir: Output directory for visualizations
-            frame_idx: Frame index
-            visualize_colors: Whether to visualize color processing
             
         Returns:
-            Dictionary mapping track_ids to dominant colors
+            Dictionary mapping track_ids to ROI data including bbox, full ROI, and cropped ROI
         """
-        dominant_colors = {}
+        extracted_rois = {}
+        
+        # Process each detection in the frame
         for detection in frame_data['detections']:
             if "bbox" not in detection or detection.get("class") != "person":
                 continue
@@ -646,22 +640,218 @@ class RoleAssigner:
             if track_id is None:
                 continue
             
-            background_color, jersey_color_rgb = self.get_dominant_color(
-                frame, bbox, output_dir, frame_idx, track_id, visualize=visualize_colors
-            )
+            # Extract both full ROI and cropped upper body ROI
+            x1, y1, x2, y2 = bbox
+            full_roi = self._extract_roi(frame, bbox, (0.0, 1.0), (0.0, 1.0))
             
-            dominant_colors[track_id] = {
-                "background_color": background_color,
-                "jersey_color": jersey_color_rgb
+            if full_roi.size == 0:
+                continue
+                
+            # Extract upper body ROI (for jersey detection)
+            upper_body_roi = self._extract_roi(frame, bbox, (0.0, 0.5), (0.0, 1.0))
+            
+            if upper_body_roi.size == 0:
+                continue
+            
+            # Convert to RGB
+            full_roi_rgb = cv2.cvtColor(full_roi, cv2.COLOR_BGR2RGB)
+            upper_roi_rgb = cv2.cvtColor(upper_body_roi, cv2.COLOR_BGR2RGB)
+            
+            # Store in dictionary
+            extracted_rois[track_id] = {
+                "bbox": bbox,
+                "full_roi": full_roi,
+                "full_roi_rgb": full_roi_rgb,
+                "upper_roi": upper_body_roi,
+                "upper_roi_rgb": upper_roi_rgb,
+                "y_range": (0.0, 0.5),  # The range used for upper body
+                "x_range": (0.0, 1.0)   # The range used for width
             }
         
+        return extracted_rois
+    
+    def _get_dominant_colors_for_rois(
+            self, 
+            frame: np.ndarray, 
+            extracted_rois: Dict[int, Dict], 
+            output_dir: Optional[str], 
+            frame_idx: int, 
+            visualize_colors: bool
+        ) -> Dict[int, Dict]:
+        """Find dominant colors for all extracted ROIs.
+        
+        Args:
+            frame: Video frame
+            extracted_rois: Dictionary of extracted ROIs
+            output_dir: Output directory for visualizations
+            frame_idx: Frame index
+            visualize_colors: Whether to create color visualizations
+            
+        Returns:
+            Dictionary mapping track_ids to dominant colors
+        """
+        dominant_colors = {}
+        
+        for track_id, roi_data in extracted_rois.items():
+            upper_roi_rgb = roi_data["upper_roi_rgb"]
+            bbox = roi_data["bbox"]
+            
+            pixels = upper_roi_rgb.reshape(-1, 3)
+            
+            if len(pixels) < 2:
+                continue
+                
+            try:
+                # Cluster colors
+                centers_lab, centers_rgb, centers_rgb_255, labels, counts = self._cluster_colors(pixels)
+                
+                # Identify background and jersey clusters
+                background_idx, jersey_idx = self._identify_background_jersey(centers_rgb_255)
+                
+                # Reorder clusters so background is first, jersey is second
+                cluster_order = [background_idx, jersey_idx]
+                sorted_centers_rgb = centers_rgb[cluster_order]
+                sorted_centers_rgb_255 = centers_rgb_255[cluster_order]
+                sorted_centers_lab = centers_lab[cluster_order]
+                
+                total_pixels = np.sum(counts)
+                percentages = counts / total_pixels
+                sorted_percentages = percentages[cluster_order]
+                
+                # Optionally visualize the results
+                if visualize_colors and output_dir and frame_idx is not None:
+                    try:
+                        self._visualize_color_clusters(
+                            frame, bbox, roi_data["full_roi_rgb"], 
+                            output_dir, frame_idx, track_id,
+                            roi_data["x_range"], roi_data["y_range"],
+                            labels, sorted_centers_rgb, sorted_centers_rgb_255,
+                            cluster_order, percentages, centers_lab
+                        )
+                    except Exception as e:
+                        print(f"Visualization error (continuing): {e}")
+                
+                # Store the dominant colors
+                background_color = tuple(int(v) for v in sorted_centers_rgb_255[0])
+                jersey_color = tuple(int(v) for v in sorted_centers_rgb_255[1])
+                
+                dominant_colors[track_id] = {
+                    "background_color": background_color,
+                    "jersey_color": jersey_color,
+                    "percentages": sorted_percentages
+                }
+                
+            except Exception as e:
+                print(f"Error in color clustering for track {track_id}: {e}")
+                continue
+        
         return dominant_colors
+    
+    def _calculate_all_detection_metadata(
+            self, 
+            frame: np.ndarray, 
+            frame_data: Dict,
+            extracted_rois: Dict[int, Dict],
+            dominant_colors: Dict[int, Dict]
+        ) -> Dict[int, Dict]:
+        """Calculate metadata for all detections including ROI overlap.
+        
+        Args:
+            frame: Video frame
+            frame_data: Frame data including detections
+            extracted_rois: Dictionary of extracted ROIs
+            dominant_colors: Dictionary of dominant colors
+            
+        Returns:
+            Dictionary mapping track_ids to metadata
+        """
+        metadata_by_track = {}
+        frame_height, frame_width = frame.shape[:2]
+        
+        # Get all background colors
+        all_background_colors_rgb = [
+            colors["background_color"] for colors in dominant_colors.values()
+        ]
+        
+        # Calculate metadata for each detection
+        for track_id, roi_data in extracted_rois.items():
+            if track_id not in dominant_colors:
+                continue
+                
+            bbox = roi_data["bbox"]
+            x1, y1, x2, y2 = bbox
+            
+            # Calculate bounding box size (normalized by frame size)
+            bbox_width, bbox_height = x2 - x1, y2 - y1
+            bbox_size = (bbox_width * bbox_height) / (frame_width * frame_height)
+            
+            # Check for ROI overlap with other detections (instead of bbox overlap)
+            roi_has_overlap = self._check_roi_overlap(track_id, extracted_rois)
+            
+            # Determine if background color is an outlier
+            background_color_rgb = dominant_colors[track_id]["background_color"]
+            background_is_outlier = self._is_background_outlier(
+                all_background_colors_rgb, background_color_rgb
+            )
+            
+            # Store metadata
+            metadata_by_track[track_id] = {
+                "roi_has_overlap": roi_has_overlap,
+                "bbox_size": bbox_size,
+                "background_is_outlier": background_is_outlier
+            }
+        
+        return metadata_by_track
+    
+    def _check_roi_overlap(self, track_id: int, extracted_rois: Dict[int, Dict]) -> bool:
+        """Check if a ROI overlaps with any other ROIs.
+        
+        Args:
+            track_id: Track ID to check
+            extracted_rois: Dictionary of extracted ROIs
+            
+        Returns:
+            True if the ROI overlaps with any other ROI
+        """
+        if track_id not in extracted_rois:
+            return False
+            
+        current_bbox = extracted_rois[track_id]["bbox"]
+        x1, y1, x2, y2 = current_bbox
+        
+        for other_id, other_roi_data in extracted_rois.items():
+            # Skip comparing with self
+            if other_id == track_id:
+                continue
+                
+            other_bbox = other_roi_data["bbox"]
+            other_x1, other_y1, other_x2, other_y2 = other_bbox
+            
+            # Check for overlap between ROIs
+            # ROIs overlap if their bounding boxes overlap
+            if not (other_x2 < x1 or other_x1 > x2 or other_y2 < y1 or other_y1 > y2):
+                # Calculate overlap area
+                overlap_width = min(x2, other_x2) - max(x1, other_x1)
+                overlap_height = min(y2, other_y2) - max(y1, other_y1)
+                overlap_area = overlap_width * overlap_height
+                
+                # Calculate minimum ROI area
+                current_area = (x2 - x1) * (y2 - y1)
+                other_area = (other_x2 - other_x1) * (other_y2 - other_y1)
+                min_area = min(current_area, other_area)
+                
+                # If overlap is significant (more than 20% of the smaller ROI)
+                if overlap_area > 0.2 * min_area:
+                    return True
+        
+        return False
     
     def _add_color_metadata_to_detections(
             self,
             frame: np.ndarray,
             frame_data: Dict,
             dominant_colors: Dict[int, Dict],
+            detection_metadata: Dict[int, Dict],
             store_results: bool,
             viz_frame: Optional[np.ndarray] = None
         ) -> None:
@@ -671,6 +861,7 @@ class RoleAssigner:
             frame: Video frame
             frame_data: Frame data including detections
             dominant_colors: Dictionary of dominant colors by track_id
+            detection_metadata: Dictionary of metadata by track_id
             store_results: Whether to store/visualize results
             viz_frame: Frame to draw visualization on
         """
@@ -678,10 +869,9 @@ class RoleAssigner:
             if "bbox" not in detection or detection.get("class") != "person":
                 continue
             
-            bbox = detection["bbox"]
             track_id = detection.get("track_id")
             
-            if track_id is None or track_id not in dominant_colors:
+            if track_id is None or track_id not in dominant_colors or track_id not in detection_metadata:
                 continue
 
             background_color_rgb = dominant_colors[track_id]["background_color"]
@@ -700,32 +890,29 @@ class RoleAssigner:
                 "closest_jersey_color": closest_color,
             }
 
-            all_background_colors_rgb = [item["background_color"] for item in dominant_colors.values()]
+            # Get metadata
+            metadata = detection_metadata[track_id]
             
-            # Calculate and add jersey attributes
-            metadata = self._calculate_detections_metadata(
-                frame, bbox, all_background_colors_rgb, background_color_rgb, 
-                jersey_color_rgb, frame_data['detections']
-            )
-
+            # If background is an outlier, set final_color to None
             if metadata["background_is_outlier"]: 
                 final_color = None
             color_info["final_color"] = final_color
             
+            # Add to detection
             detection["color_info"] = color_info
             detection["metadata"] = metadata
 
             if store_results and viz_frame is not None:
-                self._draw_detection_visualization(viz_frame, bbox, track_id, final_color)
+                self._draw_enhanced_detection_visualization(viz_frame, detection["bbox"], track_id, final_color)
     
-    def _draw_detection_visualization(
+    def _draw_enhanced_detection_visualization(
             self,
             viz_frame: np.ndarray,
             bbox: List[int],
             track_id: int,
             final_color: Optional[Union[str, Tuple[int, int, int]]]
         ) -> None:
-        """Draw visualization for a detection on the frame.
+        """Draw enhanced visualization with black bbox and semi-transparent ROI.
         
         Args:
             viz_frame: Frame to draw on
@@ -735,24 +922,34 @@ class RoleAssigner:
         """
         x1, y1, x2, y2 = bbox
         
-        if final_color is None:
-            color_bgr = (0, 0, 0)  # black
-            border_thickness = 1
-        elif isinstance(final_color, str) and final_color in self.predefined_colors:
-            # Handle predefined color name
-            color_rgb = self.predefined_colors[final_color]
-            color_bgr = (color_rgb[2], color_rgb[1], color_rgb[0])
-            border_thickness = 2
-        elif isinstance(final_color, (tuple, list)) and len(final_color) == 3:
-            # Handle raw RGB color
-            color_bgr = (final_color[2], final_color[1], final_color[0])
-            border_thickness = 2
-        else:
-            color_bgr = (0, 0, 0)  # black
-            border_thickness = 1
-
-        cv2.rectangle(viz_frame, (x1, y1), (x2, y2), color_bgr, border_thickness)
+        # 1. Draw black bounding box for all players
+        cv2.rectangle(viz_frame, (x1, y1), (x2, y2), (0, 0, 0), 2)
         
+        # 2. Draw a colored border around the upper body ROI (jersey region)
+        if final_color is not None:
+            # Convert string color names to RGB values if necessary
+            if isinstance(final_color, str) and final_color in self.predefined_colors:
+                color_value = self.predefined_colors[final_color]
+            elif isinstance(final_color, (tuple, list)) and len(final_color) == 3:
+                color_value = final_color
+            else:
+                # Skip if color format is unexpected
+                color_value = None
+                
+            if color_value is not None:
+                # Define upper body ROI (top half of bounding box)
+                upper_roi_y2 = y1 + (y2 - y1) // 2
+                
+                # Draw a thicker colored border around the ROI (3px vs 2px for black bbox)
+                cv2.rectangle(
+                    viz_frame, 
+                    (x1, y1), 
+                    (x2, upper_roi_y2), 
+                    (color_value[2], color_value[1], color_value[0]),  # BGR format for OpenCV
+                    3  # Thicker border
+                )
+        
+        # 3. Add track ID label
         if track_id is not None:
             label = f"{track_id}"
             font_scale = 0.5
@@ -760,10 +957,10 @@ class RoleAssigner:
             font = cv2.FONT_HERSHEY_PLAIN
             
             cv2.putText(viz_frame, 
-                        label, 
-                        (x1, y2 + 7), 
-                        font, font_scale, 
-                        (0, 0, 0), font_thickness, cv2.LINE_AA)
+                      label, 
+                      (x1, y2 + 7), 
+                      font, font_scale, 
+                      (0, 0, 0), font_thickness, cv2.LINE_AA)
     
     def process_detections(
             self, 
@@ -887,7 +1084,7 @@ class RoleAssigner:
             # Create a copy for visualization
             viz_frame = frame.copy()
             
-            # Add frame counter to top left (keeping this minimal indicator)
+            # Add frame counter to top left
             frame_text = f"{frame_idx}/{total_frames}"
             cv2.putText(viz_frame, 
                      frame_text, 
@@ -898,7 +1095,7 @@ class RoleAssigner:
                      1, 
                      cv2.LINE_AA)
             
-            # Draw oval indicators around players' feet
+            # Draw visualizations for each detection
             for detection in frame_data['detections']:
                 if "bbox" not in detection or detection.get("class") != "person":
                     continue
@@ -912,32 +1109,55 @@ class RoleAssigner:
                 # Get bounding box coordinates
                 x1, y1, x2, y2 = bbox
                 
-                # Calculate the position for the oval around feet
-                # The oval should be at the bottom of the bounding box
-                feet_y = y2  # Bottom of the bounding box
-                center_x = (x1 + x2) // 2  # Center of the bounding box
+                # Get team label and color
+                team_label = track_labels.get(track_id, "Unknown")
                 
-                # Calculate oval dimensions based on the width of the person
-                # The width of the oval is proportional to the width of the person
-                # but not too large or too small
-                box_width = x2 - x1
-                oval_width = int(box_width)  # 100% of person width
-                oval_height = int(oval_width * 0.4)  # Oval height is 40% of oval width
-                
-                # Get cluster index directly from detection metadata
+                # Get cluster index from detection metadata
                 cluster_idx = detection.get("metadata", {}).get("cluster")
                 
-                # Use the cluster center color if available
+                # Determine the color to use
                 if cluster_idx is not None and cluster_idx in self.cluster_centers:
                     rgb_color = self.cluster_centers[cluster_idx]["rgb"]
                 else:
                     # Fallback to default color only if necessary
-                    team_label = track_labels.get(track_id, "Unknown")
                     rgb_color = default_team_colors.get(team_label, default_team_colors["Unknown"])
                 
+                # 1. Draw black bounding box for all players
+                cv2.rectangle(viz_frame, (x1, y1), (x2, y2), (0, 0, 0), 2)
+                
+                # 2. Draw a colored border around the upper body ROI (jersey region)
+                if rgb_color is not None:
+                    # Ensure rgb_color is a tuple
+                    if not isinstance(rgb_color, tuple):
+                        try:
+                            rgb_color = tuple(rgb_color)
+                        except:
+                            # Skip if we can't convert to tuple
+                            rgb_color = None
+                    
+                    if rgb_color is not None:
+                        # Define upper body ROI (top half of bounding box)
+                        upper_roi_y2 = y1 + (y2 - y1) // 2
+                        
+                        # Draw a thicker colored border around the ROI (3px vs 2px for black bbox)
+                        cv2.rectangle(
+                            viz_frame, 
+                            (x1, y1), 
+                            (x2, upper_roi_y2), 
+                            (rgb_color[2], rgb_color[1], rgb_color[0]),  # BGR format for OpenCV
+                            3  # Thicker border
+                        )
+                
+                # 3. Draw colored oval at player's feet
+                feet_y = y2  # Bottom of the bounding box
+                center_x = (x1 + x2) // 2  # Center of the bounding box
+                
+                # Calculate oval dimensions based on the width of the person
+                box_width = x2 - x1
+                oval_width = int(box_width)  # 100% of person width
+                oval_height = int(oval_width * 0.4)  # Oval height is 40% of oval width
+                
                 # Convert RGB to BGR for OpenCV
-                if not isinstance(rgb_color, tuple):
-                    rgb_color = tuple(rgb_color)
                 color_bgr = (rgb_color[2], rgb_color[1], rgb_color[0])
                 
                 # Calculate oval parameters
@@ -956,8 +1176,19 @@ class RoleAssigner:
                     2  # Line thickness
                 )
                 
-                # Add REF/GK text label underneath the oval for these special classes
-                team_label = track_labels.get(track_id, "Unknown")
+                # 4. Add track ID label below the player
+                cv2.putText(
+                    viz_frame, 
+                    f"{track_id}", 
+                    (x1, y2 + 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.5,  # Font scale
+                    (0, 0, 0),  # Black text
+                    1,  # Line thickness
+                    cv2.LINE_AA
+                )
+                
+                # 5. Add REF/GK text label if applicable
                 if team_label.startswith("REF/GK"):
                     text = "REF/GK"
                     # Calculate text position (centered below the oval)
@@ -965,7 +1196,7 @@ class RoleAssigner:
                     text_x = center_x - text_size[0] // 2
                     text_y = feet_y + oval_height // 2 + 15  # Position below the oval
                     
-                    # Add black text without background
+                    # Add black text
                     cv2.putText(
                         viz_frame, 
                         text, 

@@ -52,9 +52,7 @@ class MinimapVisualizer:
         cap.release()
         
         # Create video writer
-        output_dir = os.path.join(base_dir, os.path.basename(input_path).split('.')[0])
-        os.makedirs(output_dir, exist_ok=True)
-        output_video_path = os.path.join(output_dir, 'minimap.mp4')
+        output_video_path = os.path.join(base_dir, 'minimap.mp4')
         fourcc = cv2.VideoWriter_fourcc(*'avc1')
         out = cv2.VideoWriter(output_video_path, fourcc, fps, (gt_w, gt_h))
         
@@ -125,9 +123,7 @@ class MinimapVisualizer:
         base_dir = os.path.join(self.output_dir, os.path.basename(input_path).split('.')[0])
         os.makedirs(base_dir, exist_ok=True)
         
-        output_dir = os.path.join(base_dir, os.path.basename(input_path).split('.')[0])
-        os.makedirs(output_dir, exist_ok=True)
-        output_video_path = os.path.join(output_dir, 'combined_view.mp4')
+        output_video_path = os.path.join(base_dir, 'combined_view.mp4')
         
         # Open both videos
         cap_original = cv2.VideoCapture(input_path)

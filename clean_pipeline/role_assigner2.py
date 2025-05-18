@@ -9,6 +9,7 @@ import json
 from collections import defaultdict, Counter
 from pydantic import BaseModel
 import math
+from sklearn.mixture import GaussianMixture
 
 
 class RoleAssigner:
@@ -82,17 +83,46 @@ class RoleAssigner:
         outlier_track_ids: List[int]
         params: Dict[str, Any]
 
-    def _cluster_tracks(self, input_path: str, avg_lab_colors: Dict[int, LABColor], store_results: bool = True) -> ClusteringResult:
+    def _determine_optimal_clusters(self, data, max_clusters=7):
+        """Determine optimal number of clusters using elbow method."""
+        distortions = []
+        K = range(1, max_clusters+1)
+        
+        for k in K:
+            kmeans = KMeans(n_clusters=k, n_init=10, random_state=42)
+            kmeans.fit(data)
+            distortions.append(kmeans.inertia_)
+        
+        # Calculate rate of decrease (approximate second derivative)
+        decreases = []
+        for i in range(len(distortions)-1):
+            decreases.append(distortions[i] - distortions[i+1])
+        
+        # Find elbow point - look for significant drop in improvement
+        elbow_point = 1  # Default
+        for i in range(len(decreases)-1):
+            if decreases[i] / decreases[i+1] > 1.5:  # Significant drop-off
+                elbow_point = i + 1
+                break
+        
+        # Ensure result is between 2-5
+        optimal_clusters = max(2, min(5, elbow_point + 1))
+        return optimal_clusters
+
+    def _cluster_tracks_dbscan(self, input_path: str, avg_lab_colors: Dict[int, LABColor], store_results: bool = True) -> ClusteringResult:
         """Cluster track colors using DBSCAN with dynamic eps adjustment to find teams and outliers."""
         track_ids = list(avg_lab_colors.keys())
         lab_colors = np.array([avg_lab_colors[track_id].to_array() for track_id in track_ids])
 
+        # First determine optimal number of clusters using elbow method
+        optimal_clusters = self._determine_optimal_clusters(lab_colors)
+        
         # DBSCAN parameters
         min_samples = max([3, math.floor(0.25 * len(track_ids))])
         min_eps = 0.1
         max_eps = 1000.0
         
-        # Binary search to find the largest eps that yields 2 clusters
+        # Binary search to find the largest eps that yields optimal_clusters
         best_labels = None
         
         while max_eps - min_eps > 0.1:  # Convergence threshold
@@ -104,40 +134,52 @@ class RoleAssigner:
             non_outlier_clusters = [c for c in unique_clusters if c != -1]
             num_clusters = len(non_outlier_clusters)
             
-            if num_clusters == 2:
-                # Found 2 clusters, try larger eps (save current result)
+            if num_clusters == optimal_clusters:
+                # Found target clusters, try larger eps (save current result)
                 best_labels = labels
                 min_eps = current_eps
-                params = {"dbscan": {"eps": current_eps, "min_samples": min_samples}}
-            elif num_clusters < 2:
+                params = {"dbscan": {"eps": current_eps, "min_samples": min_samples, "target_clusters": optimal_clusters}}
+            elif num_clusters < optimal_clusters:
                 # Too few clusters, need smaller eps
                 max_eps = current_eps
             else:
                 # Too many clusters, need larger eps
                 min_eps = current_eps
         
-        # If binary search didn't find a solution, use k-means #TODO: make this better (outlier detections)
+        # If binary search didn't find a solution, use k-means
         if best_labels is None:
-            kmeans = KMeans(n_clusters=2, n_init=10, random_state=42)
+            kmeans = KMeans(n_clusters=optimal_clusters, n_init=10, random_state=42)
             best_labels = kmeans.fit_predict(lab_colors)
-            params = {"kmeans": {"n_clusters": 2, "n_init": 10}}
+            params = {"kmeans": {"n_clusters": optimal_clusters, "n_init": 10}}
         
-        # Process clustering results
+        # Process clustering results - separate into teams and outliers
+        # First, count members in each cluster
+        cluster_sizes = Counter(best_labels)
+        
+        # Remove -1 (DBSCAN outliers) from consideration for largest clusters
+        if -1 in cluster_sizes:
+            del cluster_sizes[-1]
+        
+        # Find the two largest clusters
+        largest_clusters = [cluster for cluster, _ in cluster_sizes.most_common(2)]
+        
+        # If fewer than 2 clusters found, handle edge case
+        if len(largest_clusters) < 2:
+            largest_clusters = largest_clusters + list(range(max(largest_clusters) + 1, max(largest_clusters) + 3 - len(largest_clusters)))
+        
         team_a_tracks: List[int] = []
         team_b_tracks: List[int] = []
         outlier_tracks: List[int] = []
         
-        # Assign tracks to teams
+        # Assign tracks to teams or outliers
         for i, track_id in enumerate(track_ids):
             label = best_labels[i]
-            if label == -1:
+            if label == -1 or label not in largest_clusters:
                 outlier_tracks.append(track_id)
-            elif label == 0:
+            elif label == largest_clusters[0]:
                 team_a_tracks.append(track_id)
-            elif label == 1:
+            elif label == largest_clusters[1]:
                 team_b_tracks.append(track_id)
-            else:
-                raise ValueError(f"Unexpected cluster label: {label}")
         
         # Calculate team centers        
         if team_a_tracks:
@@ -186,10 +228,11 @@ class RoleAssigner:
                 for track_id in clustering_result.team_a_track_ids:
                     if track_id in avg_lab_colors:
                         lab_color = avg_lab_colors[track_id]
+                        norm_color = tuple(c/255 for c in lab_to_rgb_255(lab_color).to_array())
                         ax.scatter(
                             lab_color.a,
                             lab_color.b,
-                            color=team_a_norm_color,
+                            color=norm_color,
                             marker='o',
                             s=100
                         )
@@ -223,11 +266,12 @@ class RoleAssigner:
                 for track_id in clustering_result.team_b_track_ids:
                     if track_id in avg_lab_colors:
                         lab_color = avg_lab_colors[track_id]
+                        norm_color = tuple(c/255 for c in lab_to_rgb_255(lab_color).to_array())
                         ax.scatter(
                             lab_color.a,
                             lab_color.b,
-                            color=team_b_norm_color,
-                            marker='o',
+                            color=norm_color,
+                            marker='s',
                             s=100
                         )
             
@@ -276,7 +320,7 @@ class RoleAssigner:
         if team_a_color:
             legend_elements.append(plt.Line2D([0], [0], marker='o', color="w", markerfacecolor=team_a_norm_color, markersize=10, label='Team A'))
         if team_b_color:
-            legend_elements.append(plt.Line2D([0], [0], marker='o', color="w", markerfacecolor=team_b_norm_color, markersize=10, label='Team B'))
+            legend_elements.append(plt.Line2D([0], [0], marker='s', color="w", markerfacecolor=team_b_norm_color, markersize=10, label='Team B'))
         if clustering_result.outlier_track_ids:
             legend_elements.append(plt.Line2D([0], [0], marker='x', color='w', markeredgecolor='black', markersize=10, label='Outliers (Ref/GK)'))
         
@@ -291,7 +335,7 @@ class RoleAssigner:
         plt.savefig(os.path.join(output_dir, 'team_clusters.png'), dpi=150, bbox_inches='tight')
         plt.close()
 
-    def _distinguish_outliers(self, frame_detections: FrameDetections, outliers: List[int]) -> List[FrameDetections]:
+    def _distinguish_outliers(self, frame_detections: FrameDetections, outliers: List[int]) -> Dict[int, str]:
         """Decide if an outlier is a goalkeeper or a referee."""
         track_ids_in_frame = [detection.track_id for detection in frame_detections.detections]
         outliers_in_frame = [track_id for track_id in outliers if track_id in track_ids_in_frame]
@@ -325,6 +369,7 @@ class RoleAssigner:
             if y > lower_box_boundary_y and y < upper_box_boundary_y:
                 if x < left_box_boundary_x or x > right_box_boundary_x:
                     return {track_id: "GK"}
+                return {track_id: "REF"}
             else:
                 return {track_id: "REF"}
         
@@ -345,7 +390,8 @@ class RoleAssigner:
                     closest_squared_distance = squared_distance
                     ref_track_id = track_id
             
-            return_value[ref_track_id] = "REF"
+            if ref_track_id:
+                return_value[ref_track_id] = "REF"
             for track_id in outliers_in_frame:
                 if track_id not in return_value:
                     return_value[track_id] = "GK"
@@ -381,7 +427,7 @@ class RoleAssigner:
             return role_assignments
             
         # Cluster tracks and assign team labels
-        clustering_result = self._cluster_tracks(input_path, avg_lab_colors, store_results)
+        clustering_result = self._cluster_tracks_dbscan(input_path, avg_lab_colors, store_results)
         
         # Create role assignments from clustering results
         for track_id in clustering_result.team_a_track_ids:
